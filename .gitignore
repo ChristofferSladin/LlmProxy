@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+
+# Local secrets — never commit real API keys
+appsettings.Local.json
+appsettings.*.Local.json
+
+# Rider / IDE
+.idea/
+*.user
+
+# macOS
+.DS_Store
