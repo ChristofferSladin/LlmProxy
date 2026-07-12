@@ -89,6 +89,47 @@ plain `dotnet run` picks it up. Then, in LM Studio, install the
 Hub and point its **Base URL** at `http://localhost:5001/v1` (any placeholder API key and model
 — the proxy overrides both).
 
+## Working around the LM Studio plugin
+
+`openai-compat-endpoint` is the only bridge that lets LM Studio's chat GUI act as a *client* of
+a remote OpenAI-compatible server at all, but it's rigid in a way that fights everything this
+proxy is for: it requires a non-empty **Model** value per chat before it will send anything, and
+that field has no default — every new chat starts broken with `"Missing model. Set a model ID in
+plugin settings."` That's exactly the kind of per-chat manual config this project exists to
+eliminate, since the proxy already decides the model dynamically.
+
+The plugin's declared config (`src/config.ts`) *does* support a default value for that field —
+but LM Studio doesn't run `src/`, it runs a prebuilt bundle (`.lmstudio/production.js`) that's
+stale the moment you edit the source. `lms dev` rebuilds from source into a separate `dev.js`
+for live development, but that only lives for as long as the dev server keeps running — closing
+it (or restarting LM Studio) reverts you to the stale, broken bundle.
+
+The workaround: build once with `lms dev`, then promote that output into the file LM Studio
+actually loads, so the fix survives restarts without needing a dev server running forever.
+
+```bash
+cd ~/.lmstudio/extensions/plugins/ankh/openai-compat-endpoint
+# 1. Edit src/config.ts — give "model" and "baseUrl" real defaults, e.g.:
+#      baseUrl default: "http://localhost:5001/v1"
+#      model default:   "some-model"   (any non-empty placeholder — the proxy overrides it)
+
+# 2. Build from source
+~/.lmstudio/bin/lms dev &     # compiles .lmstudio/dev.js, registers with LM Studio
+sleep 5 && kill %1            # once it's built, the dev server has done its job
+
+# 3. Promote the build LM Studio actually loads
+cp .lmstudio/production.js .lmstudio/production.js.orig-bak   # keep a backup
+cp .lmstudio/dev.js .lmstudio/production.js
+
+# 4. In LM Studio: eject and reload the plugin (or restart the app)
+```
+
+After this, every new chat starts with a working model value pre-filled — the proxy's dynamic
+selection and failover take over from there, and LM Studio's per-chat config becomes a dummy the
+proxy ignores. The one thing to know: **reinstalling or updating the plugin from the Hub
+overwrites `production.js`** with the stock build again, silently undoing the fix — if that
+happens, repeat steps 2–4 (or restore from the `.orig-bak`).
+
 ## Configure
 
 Everything lives under `Proxy` in [appsettings.json](appsettings.json):
