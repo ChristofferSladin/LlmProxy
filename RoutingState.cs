@@ -18,16 +18,25 @@ public sealed class RoutingState
     // model id -> tool-incapable flag. Absent = optimistically capable. Populated by T2.
     private readonly ConcurrentDictionary<string, bool> _toolIncapable = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Bench a model after a 200-err/429. T1/T2 implement — no-op in T0.</summary>
-    public void RegisterCooldown(string model)
+    /// <summary>
+    /// Bench <paramref name="model"/> until now + <paramref name="window"/>. The window is passed in
+    /// (sourced from <c>ProxyOptions.CooldownSeconds</c> at the call site) so this component stays free
+    /// of any options dependency. Thread-safe; a later bench simply overwrites the expiry.
+    /// </summary>
+    public void RegisterCooldown(string model, TimeSpan window)
     {
-        // T1/T2 implement
+        if (string.IsNullOrEmpty(model) || window <= TimeSpan.Zero) return;
+        _cooldownUntil[model] = DateTimeOffset.UtcNow + window;
     }
 
-    /// <summary>Whether a model is currently benched. T1/T2 implement — always false in T0 so behavior is unchanged.</summary>
+    /// <summary>Whether a non-expired bench exists for <paramref name="model"/>. Expired entries are dropped.</summary>
     public bool IsCoolingDown(string model)
     {
-        // T1/T2 implement
+        if (string.IsNullOrEmpty(model)) return false;
+        if (!_cooldownUntil.TryGetValue(model, out var until)) return false;
+        if (until > DateTimeOffset.UtcNow) return true;
+        // Expired: prune so the map doesn't accumulate stale entries.
+        _cooldownUntil.TryRemove(model, out _);
         return false;
     }
 

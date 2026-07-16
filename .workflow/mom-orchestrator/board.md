@@ -82,6 +82,30 @@ existing seams instead of racing the DI container / options class.
   `ProxyOptions.cs` (already has `CooldownSeconds` from T0 — read it), `appsettings.json`
   (document default), `LlmProxy.Tests/CooldownTests.cs` (new).
 - **decisions:**
+  - **Cooldown-window wiring:** `RegisterCooldown(string model, TimeSpan window)` — the window is
+    passed in by the caller (ProxyService computes `TimeSpan.FromSeconds(Options.CooldownSeconds)`
+    once per request) rather than RoutingState reading `ProxyOptions` itself. Rationale: RoutingState
+    is registered in `Program.cs` as a plain parameterless `AddSingleton<RoutingState>()` and TestHost
+    builds `new RoutingState()`; passing the window keeps RoutingState free of an options dependency
+    and required **zero** changes to the DI registration or TestHost construction. Only ProxyService
+    calls `RegisterCooldown`, so the extra parameter has a single call surface.
+  - **Never-dead-end filter placement:** added a private `DropCoolingDown(ordered)` helper applied to
+    **both** `BuildCandidatesAsync` paths — the `ForceModels`/non-dynamic path (`route.Models`) and the
+    dynamic path (applied to the live catalog list **before** the `MaxDynamicCandidates` cap, so benched
+    models don't consume cap slots). If filtering empties the list it returns the full ordered list
+    unchanged (cooldowns ignored) so a request is always attempted.
+  - **429 vs 5xx:** only HTTP `429` benches (matches the ticket); generic `5xx` stays a plain transient
+    retry and does **not** register a cooldown. Benching happens on every `200-err`/`429` occurrence,
+    including intermediate retry attempts, which is harmless (the map just overwrites the expiry).
+  - **`IsCoolingDown` prunes expired entries** on read (expire-by-timestamp) so the concurrent map
+    doesn't accumulate stale keys. `RegisterCooldown` ignores empty model ids and non-positive windows.
+  - **Tests:** candidate chain pinned via `ForceModels:["A","B"]` (single-letter, non-overlapping so
+    FakeUpstream substring matching can't cross-match), `CooldownSeconds=300` and `MaxAttemptsPerModel=1`
+    for a clean deterministic `[A,B]` attempt chain. Request-2 A-calls asserted by slicing
+    `TriedModels` from the pre-request-2 count, not by total counts.
+- **acceptance-result:** `dotnet build` green; `dotnet test --filter FullyQualifiedName~CooldownTests`
+  -> `Passed! - Failed: 0, Passed: 3`; `FailoverTests` still green (`Passed: 2`, no regression);
+  full suite `Passed: 5`.
 - **notes:** Cooldown skip is a filter on the *already-ordered* candidate list, applied
   before the `MaxDynamicCandidates` cap. PRD criterion: "Cooldown". Never-dead-end is
   mandatory.
