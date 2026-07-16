@@ -2,7 +2,7 @@
 
 | id | title                                   | type | status | blocked-by |
 |----|-----------------------------------------|------|--------|------------|
-| T0 | test harness + seams (walking skeleton) | afk  | todo   | -          |
+| T0 | test harness + seams (walking skeleton) | afk  | done   | -          |
 | T1 | cooldown registry                       | afk  | todo   | T0         |
 | T2 | learned tool-capability map + filter    | afk  | todo   | T1         |
 | T3 | identity / continuity anchor            | afk  | todo   | T0         |
@@ -32,7 +32,7 @@ existing seams instead of racing the DI container / options class.
 
 ### T0 -- test harness + seams (walking skeleton)
 - **type:** afk
-- **status:** todo
+- **status:** done
 - **blocked-by:** -
 - **module:** FakeUpstream test seam (scripted `HttpMessageHandler` + captured-request
   log wired into the `"upstream"` named client) and a `TestHost` that constructs a
