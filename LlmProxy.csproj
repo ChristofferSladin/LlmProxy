@@ -6,4 +6,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <!-- The test project lives in a subfolder; keep its sources out of the web app's compile glob. -->
+  <ItemGroup>
+    <Compile Remove="LlmProxy.Tests/**/*.cs" />
+    <Content Remove="LlmProxy.Tests/**/*" />
+    <None Remove="LlmProxy.Tests/**/*" />
+  </ItemGroup>
+
 </Project>

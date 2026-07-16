@@ -15,16 +15,18 @@ public sealed class ProxyService
     private readonly IHttpClientFactory _httpFactory;
     private readonly ProviderRegistry _registry;
     private readonly ModelCatalog _catalog;
+    private readonly RoutingState _routing;
     private readonly ILogger<ProxyService> _logger;
 
     // Remember the last model that worked per provider so we try it first (avoids re-probing every request).
     private readonly ConcurrentDictionary<string, string> _lastGood = new(StringComparer.OrdinalIgnoreCase);
 
-    public ProxyService(IHttpClientFactory httpFactory, ProviderRegistry registry, ModelCatalog catalog, ILogger<ProxyService> logger)
+    public ProxyService(IHttpClientFactory httpFactory, ProviderRegistry registry, ModelCatalog catalog, RoutingState routing, ILogger<ProxyService> logger)
     {
         _httpFactory = httpFactory;
         _registry = registry;
         _catalog = catalog;
+        _routing = routing;
         _logger = logger;
     }
 
@@ -65,25 +67,42 @@ public sealed class ProxyService
             return;
         }
 
-        // Proxy-owned global system prompt: replace any client system message with ours.
-        if (!string.IsNullOrWhiteSpace(route.Provider.SystemPrompt) && body["messages"] is JsonArray messages)
+        // Classify request shape once (T2: carries tools? / T4: char count + content) — over the CLIENT's
+        // original messages, BEFORE the proxy injects its system prompt, so char count / content matching
+        // reflect the user's request rather than the constant proxy-owned anchor. Drives the hard
+        // tool-capability filter, whether a tool-referencing error demotes a model, and — via the
+        // declarative router — the soft prefer-override that biases candidate ordering.
+        var classification = RequestClassifier.Classify(body);
+        var hasTools = classification.HasTools;
+
+        // T4: evaluate the ordered RoutingRules against this request's shape → a soft prefer-override.
+        // Empty RoutingRules (or no match) → empty list → today's ordering exactly (backward-compat).
+        var preferOverride = new RoutingRuleSet(_registry.Options.RoutingRules).PreferOverride(classification);
+
+        // Proxy-owned global system prompt: replace any client system message with the composed one
+        // (provider base + model-agnostic identity anchor). Composed even when the provider has no base
+        // prompt, so the anchor is injected on its own. When the composition is null/empty (no base and
+        // no anchor) nothing is injected and client messages are left untouched — today's behavior.
+        var systemContent = PromptComposer.Compose(route.Provider.SystemPrompt, _registry.Options.IdentityAnchor);
+        if (!string.IsNullOrEmpty(systemContent) && body["messages"] is JsonArray messages)
         {
             for (var i = messages.Count - 1; i >= 0; i--)
                 if (messages[i] is JsonObject m && m["role"]?.GetValue<string>() == "system")
                     messages.RemoveAt(i);
-            messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = route.Provider.SystemPrompt });
+            messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = systemContent });
         }
 
         var isStream = body["stream"]?.GetValue<bool>() ?? false;
         var url = $"{route.Provider.BaseUrl.TrimEnd('/')}/{upstreamPath.TrimStart('/')}";
         var attemptTimeout = TimeSpan.FromSeconds(Math.Max(5, _registry.Options.AttemptTimeoutSeconds));
         var maxAttempts = Math.Max(1, _registry.Options.MaxAttemptsPerModel);
+        var cooldownWindow = TimeSpan.FromSeconds(Math.Max(0, _registry.Options.CooldownSeconds));
         var client = _httpFactory.CreateClient("upstream");
 
         IReadOnlyList<string> candidates;
         try
         {
-            candidates = await BuildCandidatesAsync(route, ct);
+            candidates = await BuildCandidatesAsync(route, hasTools, preferOverride, ct);
         }
         catch (Exception ex)
         {
@@ -148,8 +167,57 @@ public sealed class ProxyService
 
                 if (status is >= 200 and < 300)
                 {
+                    // Some providers (e.g. NVIDIA NIM) return HTTP 200 but carry an error payload in the
+                    // body — a ResourceExhausted / rate-limit envelope instead of a completion. Peek the
+                    // body before committing, so we can still fail over, and so the announced model name
+                    // reflects whichever candidate actually answers rather than the first to return 200.
+                    PeekResult peek;
+                    try
+                    {
+                        peek = await PeekBodyAsync(resp, isStream, timeoutCts.Token);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        resp.Dispose();
+                        return; // client aborted.
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        resp.Dispose();
+                        sw.Stop();
+                        failures.Add($"{model}:timeout");
+                        Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "timeout", sw);
+                        break; // slow time-to-first-byte won't improve on retry — next model.
+                    }
+                    catch (Exception ex)
+                    {
+                        resp.Dispose();
+                        sw.Stop();
+                        failures.Add($"{model}:neterr");
+                        Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "neterr:" + ex.GetType().Name, sw);
+                        if (attempt < maxAttempts) { await BackoffAsync(attempt, ct); continue; }
+                        break;
+                    }
+
+                    if (peek.IsError)
+                    {
+                        resp.Dispose();
+                        sw.Stop();
+                        failures.Add($"{model}:{Truncate(peek.Detail ?? "200-error", 60)}");
+                        Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "200-err", sw);
+                        // Bench this model so failover doesn't walk straight back into the same wall.
+                        _routing.RegisterCooldown(model, cooldownWindow);
+                        // If this was a tools request and the body-error references tool/function calling,
+                        // learn that this model can't do tools so future tools requests skip it (T2).
+                        if (hasTools && (IsToolCapabilityError(peek.Detail) || IsToolCapabilityError(peek.Text)))
+                            _routing.MarkToolIncapable(model);
+                        // 200 with an error body is transient (busy worker / quota): retry, then fail over.
+                        if (attempt < maxAttempts) { await BackoffAsync(attempt, ct); continue; }
+                        break;
+                    }
+
                     _lastGood[route.ProviderName] = model; // sticky: try this first next time
-                    await RelayAsync(http, resp, isStream, upstreamPath, model, ct);
+                    await RelayAsync(http, resp, peek, isStream, upstreamPath, model, ct);
                     resp.Dispose();
                     sw.Stop();
                     Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "200", sw);
@@ -161,6 +229,15 @@ public sealed class ProxyService
                 sw.Stop();
                 failures.Add($"{model}:{status}");
                 Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, status.ToString(), sw);
+
+                // A 429 means the model's pool is saturated: bench it like a 200-err so failover skips it.
+                if (status == 429) _routing.RegisterCooldown(model, cooldownWindow);
+
+                // A tools request rejected with tool/function-calling phrasing means this model can't do
+                // tools: learn it so future tools requests skip it (T2). Applies whatever the status
+                // sub-branch below does with the response (retry / surface / next model).
+                if (hasTools && IsToolCapabilityError(detail))
+                    _routing.MarkToolIncapable(model);
 
                 // 5xx / 429 are transient: retry this model, then fall through to the next.
                 if (status is 429 or >= 500)
@@ -184,26 +261,89 @@ public sealed class ProxyService
     }
 
     // Explicit config wins; otherwise pull chat-capable models live, last-good first, capped.
-    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, CancellationToken ct)
+    // Benched (cooling-down) models are dropped from the ordered list before the cap so failover
+    // doesn't re-probe a model that just hit its wall — but never dead-ends (see DropCoolingDown).
+    // The soft prefer-override (T4) is a stable reorder applied to the already-FILTERED list (so it can
+    // never re-introduce a filtered model) and BEFORE the cap (so a promoted model isn't cut). An empty
+    // override leaves ordering byte-identical to before.
+    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, IReadOnlyList<string> preferOverride, CancellationToken ct)
     {
         if (route.Provider.ForceModels.Count > 0 || !route.Provider.DynamicModels)
-            return route.Models;
+            return ApplyPreferOverride(DropToolIncapable(DropCoolingDown(route.Models), hasTools), preferOverride);
 
-        var dynamic = await _catalog.GetChatCandidatesAsync(route.ProviderName, route.Provider, ct);
+        var dynamic = DropToolIncapable(DropCoolingDown(await _catalog.GetChatCandidatesAsync(route.ProviderName, route.Provider, ct)), hasTools);
         var cap = Math.Max(1, _registry.Options.MaxDynamicCandidates);
 
-        var ordered = new List<string>(cap);
+        // Base ordering over the FULL filtered list: last-good sticky first, then the rest in order.
+        var ranked = new List<string>(dynamic.Count);
         if (_lastGood.TryGetValue(route.ProviderName, out var last) && dynamic.Contains(last))
-            ordered.Add(last);
+            ranked.Add(last);
         foreach (var id in dynamic)
-        {
-            if (ordered.Count >= cap) break;
-            if (!ordered.Contains(id)) ordered.Add(id);
-        }
-        return ordered;
+            if (!ranked.Contains(id)) ranked.Add(id);
+
+        // Soft prefer-override outranks both the provider's static ModelPrefer ordering AND last-good
+        // stickiness for this request: an explicit routing rule wins. Applied before the cap.
+        return ApplyPreferOverride(ranked, preferOverride).Take(cap).ToList();
     }
 
-    private async Task RelayAsync(HttpContext http, HttpResponseMessage upstream, bool isStream, string upstreamPath, string model, CancellationToken ct)
+    // Stable reorder: move ids matching an earlier override pattern ahead, preserving relative order
+    // otherwise. A no-op when the override is empty (returns the input unchanged), so an empty rule set
+    // reproduces today's ordering exactly. Purely biases order — never adds or drops a candidate.
+    private static IReadOnlyList<string> ApplyPreferOverride(IReadOnlyList<string> ordered, IReadOnlyList<string> prefer)
+    {
+        if (prefer.Count == 0 || ordered.Count == 0) return ordered;
+        return ordered
+            .Select((id, idx) => (id, idx))
+            .OrderBy(x => PreferRank(x.id, prefer))
+            .ThenBy(x => x.idx) // stable within a rank band (LINQ OrderBy is already stable; explicit for clarity)
+            .Select(x => x.id)
+            .ToList();
+    }
+
+    // Lower rank = promoted earlier. First matching override pattern (in order) sets the rank; ids that
+    // match no pattern sort after all matched ids while keeping their prior relative order.
+    private static int PreferRank(string id, IReadOnlyList<string> prefer)
+    {
+        for (var i = 0; i < prefer.Count; i++)
+            if (id.Contains(prefer[i], StringComparison.OrdinalIgnoreCase))
+                return i;
+        return prefer.Count;
+    }
+
+    // Filter out models currently cooling down, preserving order. Never dead-ends: if every candidate
+    // is benched, the cooldowns are ignored and the full ordered list is returned so a request is
+    // always attempted against *something*.
+    private IReadOnlyList<string> DropCoolingDown(IReadOnlyList<string> ordered)
+    {
+        var live = new List<string>(ordered.Count);
+        foreach (var id in ordered)
+            if (!_routing.IsCoolingDown(id)) live.Add(id);
+        return live.Count > 0 ? live : ordered;
+    }
+
+    // Hard filter for tools requests: drop models learned to be tool-incapable, preserving order. A
+    // no-op when the request carries no tools (non-tools requests may still use a tool-incapable model).
+    // Never dead-ends: if filtering empties the list, the filter is ignored and the input is returned so
+    // a request is always attempted against *something* (mirrors DropCoolingDown).
+    private IReadOnlyList<string> DropToolIncapable(IReadOnlyList<string> ordered, bool hasTools)
+    {
+        if (!hasTools) return ordered;
+        var capable = new List<string>(ordered.Count);
+        foreach (var id in ordered)
+            if (_routing.IsToolCapable(id)) capable.Add(id);
+        return capable.Count > 0 ? capable : ordered;
+    }
+
+    // Narrow, case-insensitive markers for an upstream error that means "this model can't do tool/function
+    // calls". Only consulted on a request that carried tools, so the optimistic default means a missed
+    // match costs at most one wasted attempt — never a false demotion of a capable model.
+    private static readonly string[] ToolErrorMarkers = { "tool", "function call", "function_call" };
+
+    private static bool IsToolCapabilityError(string? text) =>
+        !string.IsNullOrEmpty(text) &&
+        ToolErrorMarkers.Any(m => text.Contains(m, StringComparison.OrdinalIgnoreCase));
+
+    private async Task RelayAsync(HttpContext http, HttpResponseMessage upstream, PeekResult peek, bool isStream, string upstreamPath, string model, CancellationToken ct)
     {
         http.Response.StatusCode = (int)upstream.StatusCode;
         http.Response.ContentType = upstream.Content.Headers.ContentType?.ToString()
@@ -214,9 +354,33 @@ public sealed class ProxyService
         var announce = _registry.Options.AnnounceModel && upstreamPath == "chat/completions";
         var header = announce ? _registry.Options.ModelAnnounceFormat.Replace("{model}", model) : null;
 
-        if (announce && isStream)
+        if (!isStream)
         {
-            // Emit a synthetic first SSE chunk carrying the model name as assistant content.
+            // Non-streaming: the whole body was buffered during the peek.
+            if (announce && peek.ReachedEnd)
+            {
+                try
+                {
+                    var obj = JsonNode.Parse(peek.Text)!.AsObject();
+                    foreach (var choice in obj["choices"]?.AsArray() ?? new JsonArray())
+                        if (choice is JsonObject co && co["message"] is JsonObject msg)
+                            msg["content"] = header + (msg["content"]?.GetValue<string>() ?? "");
+                    await http.Response.WriteAsync(obj.ToJsonString(), ct);
+                    return;
+                }
+                catch { /* shape surprise — fall through to raw passthrough */ }
+            }
+
+            if (peek.Prefix.Length > 0) await http.Response.Body.WriteAsync(peek.Prefix, ct);
+            if (!peek.ReachedEnd) await peek.Body.CopyToAsync(http.Response.Body, ct);
+            await http.Response.Body.FlushAsync(ct);
+            return;
+        }
+
+        // Streaming: emit the announce as a synthetic first SSE chunk. The peek has already confirmed
+        // this model produced a real completion, so the name is the model that actually answered.
+        if (announce)
+        {
             var chunk = new JsonObject
             {
                 ["id"] = "proxy-announce",
@@ -230,28 +394,116 @@ public sealed class ProxyService
             await http.Response.WriteAsync($"data: {chunk.ToJsonString()}\n\n", ct);
             await http.Response.Body.FlushAsync(ct);
         }
-        else if (announce)
+
+        // Replay the bytes consumed during the peek, then splice the rest of the upstream stream.
+        if (peek.Prefix.Length > 0) await http.Response.Body.WriteAsync(peek.Prefix, ct);
+        if (!peek.ReachedEnd) await peek.Body.CopyToAsync(http.Response.Body, ct);
+        await http.Response.Body.FlushAsync(ct);
+    }
+
+    /// <summary>
+    /// Buffered look at an upstream 200 response so we can detect body-carried errors (some providers
+    /// return HTTP 200 with an error envelope) and then replay the consumed bytes. For non-streaming
+    /// the whole body is buffered; for streaming only the first SSE event(s) are sampled and the
+    /// remainder stays on <see cref="Body"/> for the relay to splice through.
+    /// </summary>
+    private sealed record PeekResult(bool IsError, string? Detail, byte[] Prefix, Stream Body, bool ReachedEnd)
+    {
+        public string Text => Encoding.UTF8.GetString(Prefix);
+    }
+
+    // How much to buffer while peeking. Streaming: enough for the first event(s). Non-streaming:
+    // large enough to hold a whole chat completion so it can be rewritten for the announce.
+    private const int StreamPeekBytes = 16 * 1024;
+    private const int BufferPeekBytes = 4 * 1024 * 1024;
+
+    private static async Task<PeekResult> PeekBodyAsync(HttpResponseMessage resp, bool isStream, CancellationToken ct)
+    {
+        var stream = await resp.Content.ReadAsStreamAsync(ct);
+        var max = isStream ? StreamPeekBytes : BufferPeekBytes;
+        var buf = new MemoryStream();
+        var tmp = new byte[8192];
+        var reachedEnd = false;
+
+        while (buf.Length < max)
         {
-            // Non-streaming: buffer, prepend the model line to the message content, rewrite.
-            var text = await upstream.Content.ReadAsStringAsync(ct);
-            try
-            {
-                var obj = JsonNode.Parse(text)!.AsObject();
-                foreach (var choice in obj["choices"]?.AsArray() ?? new JsonArray())
-                    if (choice is JsonObject co && co["message"] is JsonObject msg)
-                        msg["content"] = header + (msg["content"]?.GetValue<string>() ?? "");
-                await http.Response.WriteAsync(obj.ToJsonString(), ct);
-            }
-            catch
-            {
-                await http.Response.WriteAsync(text, ct); // fall back to passthrough on any shape surprise
-            }
-            return;
+            var n = await stream.ReadAsync(tmp.AsMemory(0, tmp.Length), ct);
+            if (n == 0) { reachedEnd = true; break; }
+            buf.Write(tmp, 0, n);
+            if (isStream && HasSseEventBoundary(buf)) break; // first full event captured — enough to judge.
         }
 
-        await using var upstreamStream = await upstream.Content.ReadAsStreamAsync(ct);
-        await upstreamStream.CopyToAsync(http.Response.Body, ct);
-        await http.Response.Body.FlushAsync(ct);
+        var prefix = buf.ToArray();
+        var (isError, detail) = ClassifyBody(Encoding.UTF8.GetString(prefix));
+        return new PeekResult(isError, detail, prefix, stream, reachedEnd);
+    }
+
+    private static bool HasSseEventBoundary(MemoryStream buf)
+    {
+        var s = Encoding.UTF8.GetString(buf.GetBuffer(), 0, (int)buf.Length);
+        return s.Contains("\n\n") || s.Contains("\r\n\r\n");
+    }
+
+    // Distinctive text markers for error bodies that aren't a parseable JSON error envelope (plain-text
+    // upstream failures). Kept narrow so legitimate completion content is never mistaken for an error.
+    private static readonly string[] ErrorTextMarkers = { "ResourceExhausted", "request limit reached" };
+
+    /// <summary>
+    /// Decide whether a 200 body is actually an error. Defensive across shapes so new providers are
+    /// covered: an OpenAI-style <c>{"error":{...}}</c> envelope (raw JSON or inside an SSE <c>data:</c>
+    /// line), an <c>{"object":"error"}</c> payload, or a distinctive plain-text marker. A payload that
+    /// carries <c>choices</c> is treated as a genuine completion and always passes.
+    /// </summary>
+    private static (bool IsError, string? Detail) ClassifyBody(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return (false, null);
+
+        var sawChoices = false;
+        foreach (var json in ExtractJsonCandidates(text))
+        {
+            JsonObject? obj;
+            try { obj = JsonNode.Parse(json) as JsonObject; }
+            catch { continue; }
+            if (obj is null) continue;
+
+            if (obj["error"] is JsonNode err) return (true, ErrText(err));
+            if (obj["object"]?.GetValue<string>() == "error")
+                return (true, obj["message"]?.GetValue<string>() ?? Truncate(json, 200));
+            if (obj["choices"] is JsonArray) sawChoices = true;
+        }
+
+        if (sawChoices) return (false, null); // a real completion — trust it.
+
+        foreach (var marker in ErrorTextMarkers)
+            if (text.Contains(marker, StringComparison.OrdinalIgnoreCase))
+                return (true, Truncate(text.Trim(), 200));
+
+        return (false, null); // unrecognised, but not obviously an error — pass through unchanged.
+    }
+
+    // Candidate JSON strings to inspect: the whole body (raw JSON error object), plus each SSE `data:`
+    // payload. Truncated/partial JSON simply fails to parse and is skipped by the caller.
+    private static IEnumerable<string> ExtractJsonCandidates(string text)
+    {
+        var trimmed = text.TrimStart();
+        if (trimmed.StartsWith('{')) yield return trimmed;
+
+        foreach (var rawLine in text.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (!line.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) continue;
+            var payload = line["data:".Length..].Trim();
+            if (payload.Length > 0 && payload != "[DONE]" && payload.StartsWith('{'))
+                yield return payload;
+        }
+    }
+
+    private static string ErrText(JsonNode err)
+    {
+        if (err is JsonObject eo)
+            return eo["message"]?.GetValue<string>() ?? Truncate(eo.ToJsonString(), 200);
+        try { return err.GetValue<string>(); }
+        catch { return Truncate(err.ToJsonString(), 200); }
     }
 
     private static Task BackoffAsync(int attempt, CancellationToken ct) =>
