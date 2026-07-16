@@ -35,4 +35,39 @@ QA branch at the end.
   to the web project (no .sln) and vacuously passes 0 tests.
 
 ## Iteration 3 — ready-set {T2}
-- dispatched…
+- **T2 done** (green, 4 tests; 13/13 full). New `RequestClassifier.HasTools`; capability half
+  of `RoutingState`; demote on a narrow tool/function error match at both the `peek.IsError`
+  and non-2xx sites, gated on `hasTools`; `DropToolIncapable` hard filter mirrors T1's
+  `DropCoolingDown`, both applied before the cap, never dead-ends. Test isolation: tool error
+  delivered as HTTP 400 (not a cooldown trigger) so capability behavior is isolated from
+  cooldown. Integrated @ 230c86c.
+
+## Iteration 4 — ready-set {T4}
+- **T4 done** (green, 5 tests; 18/18 full). Extended `RequestClassifier` with `CharCount` +
+  `Matches`; new `RoutingRuleSet.PreferOverride` (first-match-wins over ordered `RoutingRules`);
+  soft stable prefer-reorder applied in `BuildCandidatesAsync` composed with the hard
+  cooldown/tool filters (filter excludes, reorder biases; an explicit rule outranks `_lastGood`
+  for that request). Empty `RoutingRules` reproduces today's ordering (backward-compat test).
+  Classification runs over the client's original messages BEFORE anchor injection, so char/content
+  reflect the user's request not the constant anchor. First dispatch hit the session token limit
+  after the agent committed `ticket/T4`; verified independently via a no-commit test-merge
+  (clean, 18/18) then integrated @ 298a162.
+
+## Merge-night — qa/mom-orchestrator
+- Assembly was incremental: each ticket fast-forward/no-ff merged into `feat/mom-orchestrator`
+  after its own acceptance-check went green (T0 → {T1,T3} → T2 → T4), so dependent tickets always
+  branched from a base containing their blockers.
+- **Merged clean, in DAG order:** T0, T1, T3, T2, T4. **Auto-resolved conflicts:** none (T1/T3
+  touched disjoint `ProxyService` regions; board.md auto-merged). **Held back:** none.
+- **QA branch:** `qa/mom-orchestrator` (worktree `.claude/worktrees/qa-mom-orchestrator`), off the
+  assembled `feat/mom-orchestrator`. `main` untouched; nothing pushed.
+- **Integration suite:** `dotnet test LlmProxy.Tests/LlmProxy.Tests.csproj` →
+  **18/18 passed** (2 failover + 3 cooldown + 4 anchor + 4 capability + 5 router).
+- **Consolidated diffstat** (`git diff main...qa/mom-orchestrator --stat`): 21 files, +1963/-38 —
+  new `LlmProxy.Tests` project (7 test/harness files), `RoutingState`, `RequestClassifier`,
+  `RoutingRuleSet`, `PromptComposer`, and the `ProxyService`/`ProxyOptions`/`Program`/config wiring.
+  (The `ProxyService` delta vs `main` also includes the previously-uncommitted stream peek/`200-err`
+  failover, which was committed as the feature base.)
+- **DAG note for next time:** T1/T2/T4 all edit `BuildCandidatesAsync`; sequencing them (rather than
+  parallelizing) was correct — no spine collisions occurred. T3 parallel with T1 was safe.
+- Next: **/qa-plan** to review `qa/mom-orchestrator`.

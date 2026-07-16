@@ -3,7 +3,7 @@
 | id | title                                   | type | status | blocked-by |
 |----|-----------------------------------------|------|--------|------------|
 | T0 | test harness + seams (walking skeleton) | afk  | done   | -          |
-| T1 | cooldown registry                       | afk  | todo   | T0         |
+| T1 | cooldown registry                       | afk  | done   | T0         |
 | T2 | learned tool-capability map + filter    | afk  | done   | T1         |
 | T3 | identity / continuity anchor            | afk  | done   | T0         |
 | T4 | declarative heuristic router            | afk  | done   | T2         |
@@ -65,7 +65,7 @@ existing seams instead of racing the DI container / options class.
 
 ### T1 -- cooldown registry
 - **type:** afk
-- **status:** todo
+- **status:** done
 - **blocked-by:** T0
 - **module:** `RoutingState` cooldown half — `RegisterCooldown(model)` /
   `IsCoolingDown(model)` over a concurrent model→expiry-timestamp map; hides expiry
@@ -169,7 +169,7 @@ existing seams instead of racing the DI container / options class.
 
 ### T3 -- identity / continuity anchor
 - **type:** afk
-- **status:** todo
+- **status:** done
 - **blocked-by:** T0
 - **module:** `PromptComposer` — `Compose(providerSystemPrompt, anchor) → systemMessage`;
   hides append semantics and the empty-base / empty-anchor cases. Edits the disjoint
