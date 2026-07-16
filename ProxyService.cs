@@ -67,6 +67,18 @@ public sealed class ProxyService
             return;
         }
 
+        // Classify request shape once (T2: carries tools? / T4: char count + content) — over the CLIENT's
+        // original messages, BEFORE the proxy injects its system prompt, so char count / content matching
+        // reflect the user's request rather than the constant proxy-owned anchor. Drives the hard
+        // tool-capability filter, whether a tool-referencing error demotes a model, and — via the
+        // declarative router — the soft prefer-override that biases candidate ordering.
+        var classification = RequestClassifier.Classify(body);
+        var hasTools = classification.HasTools;
+
+        // T4: evaluate the ordered RoutingRules against this request's shape → a soft prefer-override.
+        // Empty RoutingRules (or no match) → empty list → today's ordering exactly (backward-compat).
+        var preferOverride = new RoutingRuleSet(_registry.Options.RoutingRules).PreferOverride(classification);
+
         // Proxy-owned global system prompt: replace any client system message with the composed one
         // (provider base + model-agnostic identity anchor). Composed even when the provider has no base
         // prompt, so the anchor is injected on its own. When the composition is null/empty (no base and
@@ -80,10 +92,6 @@ public sealed class ProxyService
             messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = systemContent });
         }
 
-        // Classify request shape once (T2: does it carry tools?). Drives the hard tool-capability
-        // filter in candidate build and gates whether a tool-referencing upstream error demotes a model.
-        var hasTools = RequestClassifier.HasTools(body);
-
         var isStream = body["stream"]?.GetValue<bool>() ?? false;
         var url = $"{route.Provider.BaseUrl.TrimEnd('/')}/{upstreamPath.TrimStart('/')}";
         var attemptTimeout = TimeSpan.FromSeconds(Math.Max(5, _registry.Options.AttemptTimeoutSeconds));
@@ -94,7 +102,7 @@ public sealed class ProxyService
         IReadOnlyList<string> candidates;
         try
         {
-            candidates = await BuildCandidatesAsync(route, hasTools, ct);
+            candidates = await BuildCandidatesAsync(route, hasTools, preferOverride, ct);
         }
         catch (Exception ex)
         {
@@ -255,23 +263,51 @@ public sealed class ProxyService
     // Explicit config wins; otherwise pull chat-capable models live, last-good first, capped.
     // Benched (cooling-down) models are dropped from the ordered list before the cap so failover
     // doesn't re-probe a model that just hit its wall — but never dead-ends (see DropCoolingDown).
-    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, CancellationToken ct)
+    // The soft prefer-override (T4) is a stable reorder applied to the already-FILTERED list (so it can
+    // never re-introduce a filtered model) and BEFORE the cap (so a promoted model isn't cut). An empty
+    // override leaves ordering byte-identical to before.
+    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, IReadOnlyList<string> preferOverride, CancellationToken ct)
     {
         if (route.Provider.ForceModels.Count > 0 || !route.Provider.DynamicModels)
-            return DropToolIncapable(DropCoolingDown(route.Models), hasTools);
+            return ApplyPreferOverride(DropToolIncapable(DropCoolingDown(route.Models), hasTools), preferOverride);
 
         var dynamic = DropToolIncapable(DropCoolingDown(await _catalog.GetChatCandidatesAsync(route.ProviderName, route.Provider, ct)), hasTools);
         var cap = Math.Max(1, _registry.Options.MaxDynamicCandidates);
 
-        var ordered = new List<string>(cap);
+        // Base ordering over the FULL filtered list: last-good sticky first, then the rest in order.
+        var ranked = new List<string>(dynamic.Count);
         if (_lastGood.TryGetValue(route.ProviderName, out var last) && dynamic.Contains(last))
-            ordered.Add(last);
+            ranked.Add(last);
         foreach (var id in dynamic)
-        {
-            if (ordered.Count >= cap) break;
-            if (!ordered.Contains(id)) ordered.Add(id);
-        }
-        return ordered;
+            if (!ranked.Contains(id)) ranked.Add(id);
+
+        // Soft prefer-override outranks both the provider's static ModelPrefer ordering AND last-good
+        // stickiness for this request: an explicit routing rule wins. Applied before the cap.
+        return ApplyPreferOverride(ranked, preferOverride).Take(cap).ToList();
+    }
+
+    // Stable reorder: move ids matching an earlier override pattern ahead, preserving relative order
+    // otherwise. A no-op when the override is empty (returns the input unchanged), so an empty rule set
+    // reproduces today's ordering exactly. Purely biases order — never adds or drops a candidate.
+    private static IReadOnlyList<string> ApplyPreferOverride(IReadOnlyList<string> ordered, IReadOnlyList<string> prefer)
+    {
+        if (prefer.Count == 0 || ordered.Count == 0) return ordered;
+        return ordered
+            .Select((id, idx) => (id, idx))
+            .OrderBy(x => PreferRank(x.id, prefer))
+            .ThenBy(x => x.idx) // stable within a rank band (LINQ OrderBy is already stable; explicit for clarity)
+            .Select(x => x.id)
+            .ToList();
+    }
+
+    // Lower rank = promoted earlier. First matching override pattern (in order) sets the rank; ids that
+    // match no pattern sort after all matched ids while keeping their prior relative order.
+    private static int PreferRank(string id, IReadOnlyList<string> prefer)
+    {
+        for (var i = 0; i < prefer.Count; i++)
+            if (id.Contains(prefer[i], StringComparison.OrdinalIgnoreCase))
+                return i;
+        return prefer.Count;
     }
 
     // Filter out models currently cooling down, preserving order. Never dead-ends: if every candidate

@@ -6,7 +6,7 @@
 | T1 | cooldown registry                       | afk  | todo   | T0         |
 | T2 | learned tool-capability map + filter    | afk  | done   | T1         |
 | T3 | identity / continuity anchor            | afk  | done   | T0         |
-| T4 | declarative heuristic router            | afk  | todo   | T2         |
+| T4 | declarative heuristic router            | afk  | done   | T2         |
 
 **DAG / ready-set flow**
 
@@ -205,7 +205,7 @@ existing seams instead of racing the DI container / options class.
 
 ### T4 -- declarative heuristic router
 - **type:** afk
-- **status:** todo
+- **status:** done
 - **blocked-by:** T2
 - **module:** `RequestClassifier` extension (`charCount`, `contentMatches`) + `RoutingRuleSet`
   — `PreferOverride(classification) → prefer-patterns` over the ordered `RoutingRules`;
@@ -225,6 +225,47 @@ existing seams instead of racing the DI container / options class.
   `ProxyOptions.cs` (already has `RoutingRules` + types from T0), `appsettings.json`
   (example rules, commented/empty by default), `LlmProxy.Tests/RoutingRulesTests.cs` (new).
 - **decisions:**
+  - **Classify once, over the CLIENT's original request — BEFORE the anchor injection.** New
+    `RequestClassifier.Classify(body) → RequestClassification{HasTools, Content}` (with `CharCount =>
+    Content.Length` and `Matches(patterns)`); the requested `CharCount(body)`/`Matches(body,patterns)`
+    static helpers exist too as thin building blocks. Classification is computed **once** per request and
+    the call was **moved above** the T3 system-prompt injection block. Rationale: the identity anchor is a
+    ~400-char constant proxy-owned string; classifying after injection made every "small" prompt exceed a
+    `minChars` threshold (the (b) test caught this). Keying on the user's messages is the correct semantic
+    and keeps `minChars`/`contentMatches` meaningful. `hasTools` is unaffected by the move (injection only
+    touches system messages). Content concatenation is one pass over `messages[].content`, handling both the
+    string form and the multimodal array-of-parts form (text parts only); newline-joined.
+  - **FIRST-MATCH-WINS.** `RoutingRuleSet.PreferOverride(classification)` walks `Options.RoutingRules` in
+    order and returns the `prefer` list of the first rule whose `when` matches (then stops); no match →
+    empty list. A `when` matches iff every *specified* sub-condition holds: `HasTools` (if set) equals the
+    request's hasTools; `MinChars` (if set) ≤ char count; `ContentMatches` (if non-empty) — any pattern
+    present (case-insensitive substring). Unset sub-conditions are ignored. Chosen over compose-all for
+    predictability and order-explicitness (put specific rules first).
+  - **Soft reorder = stable, applied to the already-FILTERED list, before the cap.** Added
+    `ApplyPreferOverride(ordered, prefer)` in ProxyService: a stable reorder that moves ids matching an
+    earlier prefer-pattern ahead, preserving relative order otherwise (LINQ `OrderBy` by first-matching
+    pattern index, ties by original index). It is a pure bias — never adds or drops a candidate. Composition
+    order on BOTH candidate paths: `ApplyPreferOverride(DropToolIncapable(DropCoolingDown(list), hasTools),
+    prefer)` — i.e. the hard cooldown + tool filters run FIRST, then the soft reorder over the survivors, so
+    a promoted-but-filtered model can never be re-introduced ("filter excludes, reorder biases"). Empty
+    `prefer` → `ApplyPreferOverride` returns the input unchanged → today's ordering byte-identical.
+  - **Override outranks `_lastGood` for that request.** On the dynamic path the base ordering is still
+    built last-good-first over the *full* filtered list, then `ApplyPreferOverride` is applied (so a rule's
+    prefer patterns sort ahead of the sticky last-good), and only then is `MaxDynamicCandidates` applied —
+    reorder happens **before the cap** so a promoted model isn't cut. When `prefer` is empty this collapses
+    to exactly the prior last-good-first-then-cap behavior. `ForceModels`/static path has no last-good/cap,
+    so it is just `ApplyPreferOverride(filtered, prefer)`.
+  - **`RoutingRuleSet` constructed per-request from options, no DI churn.** `new
+    RoutingRuleSet(_registry.Options.RoutingRules)` in `ProxyService` (like T1/T2 keeping RoutingState
+    parameterless) — zero changes to `Program.cs` DI or `TestHost`.
+  - **appsettings.json left WITHOUT `RoutingRules`.** JSON has no comments and the ticket recommends keeping
+    the committed config's rules absent/empty; an absent list deserializes to the empty `List<RoutingRule>`
+    default → today's ordering (the (d) backward-compat test). No inert example array was added to avoid any
+    risk of it biasing the real NVIDIA route; the rule shape is documented here and by `ProxyOptions`
+    XML-doc. So `appsettings.json` is untouched by T4.
+- **acceptance-result:** `dotnet build` green; `dotnet test LlmProxy.Tests/LlmProxy.Tests.csproj --filter
+  FullyQualifiedName~RoutingRulesTests` -> `Passed! - Failed: 0, Passed: 5`; full suite `dotnet test
+  LlmProxy.Tests/LlmProxy.Tests.csproj` -> `Passed! - Failed: 0, Passed: 18` (prior 13 + 5 new, no regression).
 - **notes:** Soft reorder only — must not exclude candidates (that's the tool filter's job)
   and must not multiply upstream calls. Empty-baseline test guards backward-compat. PRD
   criterion: "Routing rules".
