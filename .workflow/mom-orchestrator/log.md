@@ -22,4 +22,17 @@ QA branch at the end.
   Integrated to `feat/mom-orchestrator` @ 64e818f.
 
 ## Iteration 2 — ready-set {T1, T3} (parallel)
+- **T3 done** (green, 4 tests). New `PromptComposer.Compose`; widened injection guard so
+  the anchor injects even with no provider base prompt; both-blank leaves client system
+  messages byte-identical to today. Integrated @ 770b534.
+- **T1 done** (green, 3 tests). Cooldown half of `RoutingState`; benches on `peek.IsError`
+  and HTTP 429 (not generic 5xx); `DropCoolingDown` filters both candidate paths before the
+  cap, full-list fallback = never dead-end. Wiring choice: `RegisterCooldown(model, window)`
+  with ProxyService supplying the window, so RoutingState stays options-free (no DI/TestHost
+  change). Integrated @ d24ad62 (clean 3-way merge with T3; disjoint ProxyService regions).
+- Integrated suite: **9/9 green** (`dotnet test LlmProxy.Tests/LlmProxy.Tests.csproj`).
+  NOTE: run tests against the test csproj explicitly — `dotnet test` at repo root resolves
+  to the web project (no .sln) and vacuously passes 0 tests.
+
+## Iteration 3 — ready-set {T2}
 - dispatched…
