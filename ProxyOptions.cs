@@ -40,6 +40,34 @@ public sealed class ProxyOptions
     /// (e.g. "fast") that maps to a specific provider + upstream model id.
     /// </summary>
     public Dictionary<string, ModelAlias> ModelAliases { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>How long a model is benched after a 200-err/429 before it is a candidate again. Consumed by T1.</summary>
+    public int CooldownSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Proxy-owned, model-agnostic instruction appended after the provider's system prompt. Tells the
+    /// model it is one of several open models behind a failover proxy, to maintain continuity, and not
+    /// to claim to be a specific commercial model. Blank disables. Consumed by T3.
+    /// </summary>
+    public string IdentityAnchor { get; set; } = "You are one of several open models served via NVIDIA NIM behind a failover proxy. Earlier turns in this conversation may have been answered by a different model — maintain continuity and do not break character. Do not claim to be a specific commercial model (e.g. Claude, GPT); if asked which model you are, say you are an open model routed by a local proxy.";
+
+    /// <summary>Ordered declarative routing rules that bias candidate prefer-ordering by request shape. Empty = today's ordering. Consumed by T4.</summary>
+    public List<RoutingRule> RoutingRules { get; set; } = new();
+}
+
+/// <summary>A single declarative routing rule: when the request matches <see cref="When"/>, bias toward <see cref="Prefer"/>.</summary>
+public sealed class RoutingRule
+{
+    public RoutingWhen When { get; set; } = new();
+    public List<string> Prefer { get; set; } = new();
+}
+
+/// <summary>Match conditions for a <see cref="RoutingRule"/>. Null/empty fields are ignored (unconstrained).</summary>
+public sealed class RoutingWhen
+{
+    public bool? HasTools { get; set; }
+    public int? MinChars { get; set; }
+    public List<string> ContentMatches { get; set; } = new();
 }
 
 public sealed class ProviderOptions

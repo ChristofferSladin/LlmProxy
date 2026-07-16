@@ -15,16 +15,18 @@ public sealed class ProxyService
     private readonly IHttpClientFactory _httpFactory;
     private readonly ProviderRegistry _registry;
     private readonly ModelCatalog _catalog;
+    private readonly RoutingState _routing;
     private readonly ILogger<ProxyService> _logger;
 
     // Remember the last model that worked per provider so we try it first (avoids re-probing every request).
     private readonly ConcurrentDictionary<string, string> _lastGood = new(StringComparer.OrdinalIgnoreCase);
 
-    public ProxyService(IHttpClientFactory httpFactory, ProviderRegistry registry, ModelCatalog catalog, ILogger<ProxyService> logger)
+    public ProxyService(IHttpClientFactory httpFactory, ProviderRegistry registry, ModelCatalog catalog, RoutingState routing, ILogger<ProxyService> logger)
     {
         _httpFactory = httpFactory;
         _registry = registry;
         _catalog = catalog;
+        _routing = routing;
         _logger = logger;
     }
 

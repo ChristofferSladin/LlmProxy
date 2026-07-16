@@ -56,7 +56,7 @@ existing seams instead of racing the DI container / options class.
   `RoutingRule`/`RoutingWhen` types, unused), `RoutingState.cs` (new skeleton),
   `Program.cs` (register `RoutingState` singleton), `ProxyService.cs` (ctor-inject
   `RoutingState` field only).
-- **decisions:**
+- **decisions:** Confirmed `ForceModels` makes `BuildCandidatesAsync` return `route.Models` (the fixed chain) and skip the dynamic /v1/models fetch — `TestHost` pins `ForceModels:["deepseek","llama"]` so candidates are offline & deterministic. The test project nests under the web project, so its sources are removed from `LlmProxy.csproj`'s compile glob and it declares `FrameworkReference Microsoft.AspNetCore.App` (it's a non-Web SDK project) to see `HttpContext`/`IHttpClientFactory`. `FailoverTests.First_model_...` sets `MaxAttemptsPerModel=1` so the recorded chain is exactly `[deepseek, llama]` (no per-model retry noise) while still exercising the 200-err peek/classify/failover path.
 - **notes:** Do NOT use `WebApplicationFactory` — construct `ProxyService` directly over
   fakes (chosen approach). Must not regress `PeekBodyAsync`/`ClassifyBody`/`RelayAsync`;
   the failover test exercises that path. Establishes how later tickets observe routing

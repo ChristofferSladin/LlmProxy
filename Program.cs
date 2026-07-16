@@ -13,6 +13,7 @@ builder.Services.AddHttpClient("upstream", c =>
 });
 builder.Services.AddSingleton<ProviderRegistry>();
 builder.Services.AddSingleton<ModelCatalog>();
+builder.Services.AddSingleton<RoutingState>();
 builder.Services.AddSingleton<ProxyService>();
 
 var app = builder.Build();
