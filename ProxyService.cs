@@ -80,6 +80,7 @@ public sealed class ProxyService
         var url = $"{route.Provider.BaseUrl.TrimEnd('/')}/{upstreamPath.TrimStart('/')}";
         var attemptTimeout = TimeSpan.FromSeconds(Math.Max(5, _registry.Options.AttemptTimeoutSeconds));
         var maxAttempts = Math.Max(1, _registry.Options.MaxAttemptsPerModel);
+        var cooldownWindow = TimeSpan.FromSeconds(Math.Max(0, _registry.Options.CooldownSeconds));
         var client = _httpFactory.CreateClient("upstream");
 
         IReadOnlyList<string> candidates;
@@ -188,6 +189,8 @@ public sealed class ProxyService
                         sw.Stop();
                         failures.Add($"{model}:{Truncate(peek.Detail ?? "200-error", 60)}");
                         Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "200-err", sw);
+                        // Bench this model so failover doesn't walk straight back into the same wall.
+                        _routing.RegisterCooldown(model, cooldownWindow);
                         // 200 with an error body is transient (busy worker / quota): retry, then fail over.
                         if (attempt < maxAttempts) { await BackoffAsync(attempt, ct); continue; }
                         break;
@@ -206,6 +209,9 @@ public sealed class ProxyService
                 sw.Stop();
                 failures.Add($"{model}:{status}");
                 Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, status.ToString(), sw);
+
+                // A 429 means the model's pool is saturated: bench it like a 200-err so failover skips it.
+                if (status == 429) _routing.RegisterCooldown(model, cooldownWindow);
 
                 // 5xx / 429 are transient: retry this model, then fall through to the next.
                 if (status is 429 or >= 500)
@@ -229,12 +235,14 @@ public sealed class ProxyService
     }
 
     // Explicit config wins; otherwise pull chat-capable models live, last-good first, capped.
+    // Benched (cooling-down) models are dropped from the ordered list before the cap so failover
+    // doesn't re-probe a model that just hit its wall — but never dead-ends (see DropCoolingDown).
     private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, CancellationToken ct)
     {
         if (route.Provider.ForceModels.Count > 0 || !route.Provider.DynamicModels)
-            return route.Models;
+            return DropCoolingDown(route.Models);
 
-        var dynamic = await _catalog.GetChatCandidatesAsync(route.ProviderName, route.Provider, ct);
+        var dynamic = DropCoolingDown(await _catalog.GetChatCandidatesAsync(route.ProviderName, route.Provider, ct));
         var cap = Math.Max(1, _registry.Options.MaxDynamicCandidates);
 
         var ordered = new List<string>(cap);
@@ -246,6 +254,17 @@ public sealed class ProxyService
             if (!ordered.Contains(id)) ordered.Add(id);
         }
         return ordered;
+    }
+
+    // Filter out models currently cooling down, preserving order. Never dead-ends: if every candidate
+    // is benched, the cooldowns are ignored and the full ordered list is returned so a request is
+    // always attempted against *something*.
+    private IReadOnlyList<string> DropCoolingDown(IReadOnlyList<string> ordered)
+    {
+        var live = new List<string>(ordered.Count);
+        foreach (var id in ordered)
+            if (!_routing.IsCoolingDown(id)) live.Add(id);
+        return live.Count > 0 ? live : ordered;
     }
 
     private async Task RelayAsync(HttpContext http, HttpResponseMessage upstream, PeekResult peek, bool isStream, string upstreamPath, string model, CancellationToken ct)
