@@ -148,8 +148,51 @@ public sealed class ProxyService
 
                 if (status is >= 200 and < 300)
                 {
+                    // Some providers (e.g. NVIDIA NIM) return HTTP 200 but carry an error payload in the
+                    // body — a ResourceExhausted / rate-limit envelope instead of a completion. Peek the
+                    // body before committing, so we can still fail over, and so the announced model name
+                    // reflects whichever candidate actually answers rather than the first to return 200.
+                    PeekResult peek;
+                    try
+                    {
+                        peek = await PeekBodyAsync(resp, isStream, timeoutCts.Token);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        resp.Dispose();
+                        return; // client aborted.
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        resp.Dispose();
+                        sw.Stop();
+                        failures.Add($"{model}:timeout");
+                        Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "timeout", sw);
+                        break; // slow time-to-first-byte won't improve on retry — next model.
+                    }
+                    catch (Exception ex)
+                    {
+                        resp.Dispose();
+                        sw.Stop();
+                        failures.Add($"{model}:neterr");
+                        Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "neterr:" + ex.GetType().Name, sw);
+                        if (attempt < maxAttempts) { await BackoffAsync(attempt, ct); continue; }
+                        break;
+                    }
+
+                    if (peek.IsError)
+                    {
+                        resp.Dispose();
+                        sw.Stop();
+                        failures.Add($"{model}:{Truncate(peek.Detail ?? "200-error", 60)}");
+                        Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "200-err", sw);
+                        // 200 with an error body is transient (busy worker / quota): retry, then fail over.
+                        if (attempt < maxAttempts) { await BackoffAsync(attempt, ct); continue; }
+                        break;
+                    }
+
                     _lastGood[route.ProviderName] = model; // sticky: try this first next time
-                    await RelayAsync(http, resp, isStream, upstreamPath, model, ct);
+                    await RelayAsync(http, resp, peek, isStream, upstreamPath, model, ct);
                     resp.Dispose();
                     sw.Stop();
                     Log(upstreamPath, clientModel, model, route.ProviderName, isStream, attempt, "200", sw);
@@ -203,7 +246,7 @@ public sealed class ProxyService
         return ordered;
     }
 
-    private async Task RelayAsync(HttpContext http, HttpResponseMessage upstream, bool isStream, string upstreamPath, string model, CancellationToken ct)
+    private async Task RelayAsync(HttpContext http, HttpResponseMessage upstream, PeekResult peek, bool isStream, string upstreamPath, string model, CancellationToken ct)
     {
         http.Response.StatusCode = (int)upstream.StatusCode;
         http.Response.ContentType = upstream.Content.Headers.ContentType?.ToString()
@@ -214,9 +257,33 @@ public sealed class ProxyService
         var announce = _registry.Options.AnnounceModel && upstreamPath == "chat/completions";
         var header = announce ? _registry.Options.ModelAnnounceFormat.Replace("{model}", model) : null;
 
-        if (announce && isStream)
+        if (!isStream)
         {
-            // Emit a synthetic first SSE chunk carrying the model name as assistant content.
+            // Non-streaming: the whole body was buffered during the peek.
+            if (announce && peek.ReachedEnd)
+            {
+                try
+                {
+                    var obj = JsonNode.Parse(peek.Text)!.AsObject();
+                    foreach (var choice in obj["choices"]?.AsArray() ?? new JsonArray())
+                        if (choice is JsonObject co && co["message"] is JsonObject msg)
+                            msg["content"] = header + (msg["content"]?.GetValue<string>() ?? "");
+                    await http.Response.WriteAsync(obj.ToJsonString(), ct);
+                    return;
+                }
+                catch { /* shape surprise — fall through to raw passthrough */ }
+            }
+
+            if (peek.Prefix.Length > 0) await http.Response.Body.WriteAsync(peek.Prefix, ct);
+            if (!peek.ReachedEnd) await peek.Body.CopyToAsync(http.Response.Body, ct);
+            await http.Response.Body.FlushAsync(ct);
+            return;
+        }
+
+        // Streaming: emit the announce as a synthetic first SSE chunk. The peek has already confirmed
+        // this model produced a real completion, so the name is the model that actually answered.
+        if (announce)
+        {
             var chunk = new JsonObject
             {
                 ["id"] = "proxy-announce",
@@ -230,28 +297,116 @@ public sealed class ProxyService
             await http.Response.WriteAsync($"data: {chunk.ToJsonString()}\n\n", ct);
             await http.Response.Body.FlushAsync(ct);
         }
-        else if (announce)
+
+        // Replay the bytes consumed during the peek, then splice the rest of the upstream stream.
+        if (peek.Prefix.Length > 0) await http.Response.Body.WriteAsync(peek.Prefix, ct);
+        if (!peek.ReachedEnd) await peek.Body.CopyToAsync(http.Response.Body, ct);
+        await http.Response.Body.FlushAsync(ct);
+    }
+
+    /// <summary>
+    /// Buffered look at an upstream 200 response so we can detect body-carried errors (some providers
+    /// return HTTP 200 with an error envelope) and then replay the consumed bytes. For non-streaming
+    /// the whole body is buffered; for streaming only the first SSE event(s) are sampled and the
+    /// remainder stays on <see cref="Body"/> for the relay to splice through.
+    /// </summary>
+    private sealed record PeekResult(bool IsError, string? Detail, byte[] Prefix, Stream Body, bool ReachedEnd)
+    {
+        public string Text => Encoding.UTF8.GetString(Prefix);
+    }
+
+    // How much to buffer while peeking. Streaming: enough for the first event(s). Non-streaming:
+    // large enough to hold a whole chat completion so it can be rewritten for the announce.
+    private const int StreamPeekBytes = 16 * 1024;
+    private const int BufferPeekBytes = 4 * 1024 * 1024;
+
+    private static async Task<PeekResult> PeekBodyAsync(HttpResponseMessage resp, bool isStream, CancellationToken ct)
+    {
+        var stream = await resp.Content.ReadAsStreamAsync(ct);
+        var max = isStream ? StreamPeekBytes : BufferPeekBytes;
+        var buf = new MemoryStream();
+        var tmp = new byte[8192];
+        var reachedEnd = false;
+
+        while (buf.Length < max)
         {
-            // Non-streaming: buffer, prepend the model line to the message content, rewrite.
-            var text = await upstream.Content.ReadAsStringAsync(ct);
-            try
-            {
-                var obj = JsonNode.Parse(text)!.AsObject();
-                foreach (var choice in obj["choices"]?.AsArray() ?? new JsonArray())
-                    if (choice is JsonObject co && co["message"] is JsonObject msg)
-                        msg["content"] = header + (msg["content"]?.GetValue<string>() ?? "");
-                await http.Response.WriteAsync(obj.ToJsonString(), ct);
-            }
-            catch
-            {
-                await http.Response.WriteAsync(text, ct); // fall back to passthrough on any shape surprise
-            }
-            return;
+            var n = await stream.ReadAsync(tmp.AsMemory(0, tmp.Length), ct);
+            if (n == 0) { reachedEnd = true; break; }
+            buf.Write(tmp, 0, n);
+            if (isStream && HasSseEventBoundary(buf)) break; // first full event captured — enough to judge.
         }
 
-        await using var upstreamStream = await upstream.Content.ReadAsStreamAsync(ct);
-        await upstreamStream.CopyToAsync(http.Response.Body, ct);
-        await http.Response.Body.FlushAsync(ct);
+        var prefix = buf.ToArray();
+        var (isError, detail) = ClassifyBody(Encoding.UTF8.GetString(prefix));
+        return new PeekResult(isError, detail, prefix, stream, reachedEnd);
+    }
+
+    private static bool HasSseEventBoundary(MemoryStream buf)
+    {
+        var s = Encoding.UTF8.GetString(buf.GetBuffer(), 0, (int)buf.Length);
+        return s.Contains("\n\n") || s.Contains("\r\n\r\n");
+    }
+
+    // Distinctive text markers for error bodies that aren't a parseable JSON error envelope (plain-text
+    // upstream failures). Kept narrow so legitimate completion content is never mistaken for an error.
+    private static readonly string[] ErrorTextMarkers = { "ResourceExhausted", "request limit reached" };
+
+    /// <summary>
+    /// Decide whether a 200 body is actually an error. Defensive across shapes so new providers are
+    /// covered: an OpenAI-style <c>{"error":{...}}</c> envelope (raw JSON or inside an SSE <c>data:</c>
+    /// line), an <c>{"object":"error"}</c> payload, or a distinctive plain-text marker. A payload that
+    /// carries <c>choices</c> is treated as a genuine completion and always passes.
+    /// </summary>
+    private static (bool IsError, string? Detail) ClassifyBody(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return (false, null);
+
+        var sawChoices = false;
+        foreach (var json in ExtractJsonCandidates(text))
+        {
+            JsonObject? obj;
+            try { obj = JsonNode.Parse(json) as JsonObject; }
+            catch { continue; }
+            if (obj is null) continue;
+
+            if (obj["error"] is JsonNode err) return (true, ErrText(err));
+            if (obj["object"]?.GetValue<string>() == "error")
+                return (true, obj["message"]?.GetValue<string>() ?? Truncate(json, 200));
+            if (obj["choices"] is JsonArray) sawChoices = true;
+        }
+
+        if (sawChoices) return (false, null); // a real completion — trust it.
+
+        foreach (var marker in ErrorTextMarkers)
+            if (text.Contains(marker, StringComparison.OrdinalIgnoreCase))
+                return (true, Truncate(text.Trim(), 200));
+
+        return (false, null); // unrecognised, but not obviously an error — pass through unchanged.
+    }
+
+    // Candidate JSON strings to inspect: the whole body (raw JSON error object), plus each SSE `data:`
+    // payload. Truncated/partial JSON simply fails to parse and is skipped by the caller.
+    private static IEnumerable<string> ExtractJsonCandidates(string text)
+    {
+        var trimmed = text.TrimStart();
+        if (trimmed.StartsWith('{')) yield return trimmed;
+
+        foreach (var rawLine in text.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (!line.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) continue;
+            var payload = line["data:".Length..].Trim();
+            if (payload.Length > 0 && payload != "[DONE]" && payload.StartsWith('{'))
+                yield return payload;
+        }
+    }
+
+    private static string ErrText(JsonNode err)
+    {
+        if (err is JsonObject eo)
+            return eo["message"]?.GetValue<string>() ?? Truncate(eo.ToJsonString(), 200);
+        try { return err.GetValue<string>(); }
+        catch { return Truncate(err.ToJsonString(), 200); }
     }
 
     private static Task BackoffAsync(int attempt, CancellationToken ct) =>
