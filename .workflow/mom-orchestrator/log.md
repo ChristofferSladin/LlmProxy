@@ -71,3 +71,12 @@ QA branch at the end.
 - **DAG note for next time:** T1/T2/T4 all edit `BuildCandidatesAsync`; sequencing them (rather than
   parallelizing) was correct — no spine collisions occurred. T3 parallel with T1 was safe.
 - Next: **/qa-plan** to review `qa/mom-orchestrator`.
+
+## QA follow-up — T5 (day-shift)
+- Live smoke tests off `qa/mom-orchestrator`: **T3 anchor confirmed live** ("I am an open model
+  routed by a local proxy" — no Claude confabulation). Peek/failover/retry confirmed against real
+  429s + timeouts. Cooldown *skip* could not be reproduced live (NVIDIA exhaustion intermittent).
+- **T5 done** (green, 2 tests; 20/20 full) — added `CooldownSkipTests` to close that gap
+  deterministically: pre-benches a model via the public `TestHost.Routing` and asserts the candidate
+  order omits it, plus the all-benched never-dead-end fallback. Test-only, no production change.
+- Merged `qa/mom-orchestrator` → `main` after 20/20 green.

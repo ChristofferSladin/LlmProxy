@@ -7,6 +7,7 @@
 | T2 | learned tool-capability map + filter    | afk  | done   | T1         |
 | T3 | identity / continuity anchor            | afk  | done   | T0         |
 | T4 | declarative heuristic router            | afk  | done   | T2         |
+| T5 | deterministic cooldown-skip test        | afk  | done   | T1         |
 
 **DAG / ready-set flow**
 
@@ -269,3 +270,22 @@ existing seams instead of racing the DI container / options class.
 - **notes:** Soft reorder only — must not exclude candidates (that's the tool filter's job)
   and must not multiply upstream calls. Empty-baseline test guards backward-compat. PRD
   criterion: "Routing rules".
+
+### T5 -- deterministic cooldown-skip test
+- **type:** afk
+- **status:** done
+- **blocked-by:** T1
+- **module:** test-only. Closes the QA gap where the live smoke test could not reproduce the
+  cooldown *skip* in isolation (NVIDIA exhaustion was intermittent). Pre-benches a model directly
+  via `TestHost.Routing.RegisterCooldown` and asserts the candidate order omits it — isolating the
+  skip from the 200-err/429 trigger path that `CooldownTests` already covers end-to-end.
+- **slice:** `CooldownSkipTests` → (a) pre-bench "A", both models scripted good, one request, assert
+  ONLY "B" was called (A skipped) and B answered; (b) pre-bench BOTH, assert the request still
+  attempts and answers (never dead-end → cooldowns ignored, full order used, A tried first).
+- **acceptance-check:** `dotnet test LlmProxy.Tests/LlmProxy.Tests.csproj --filter FullyQualifiedName~CooldownSkipTests` -> green
+- **files-likely-touched:** `LlmProxy.Tests/CooldownSkipTests.cs` (new).
+- **decisions:** Added day-shift (human present) rather than via a nightshift worktree — it's a
+  single test file, no production-code change. Pre-benching directly through the public
+  `TestHost.Routing` proves the skip deterministically without depending on the trigger path.
+- **notes:** Follow-up from QA of `qa/mom-orchestrator`. Does not touch production code, so no
+  regression surface.
