@@ -40,16 +40,24 @@ public sealed class RoutingState
         return false;
     }
 
-    /// <summary>Remember a model as tool-incapable after an explicit tool/function error. T1/T2 implement — no-op in T0.</summary>
+    /// <summary>
+    /// Remember <paramref name="model"/> as tool-incapable after an explicit tool/function error on a
+    /// request that carried <c>tools</c>. Thread-safe; idempotent (re-marking just overwrites). Silence
+    /// (a model answering a tools request in prose) must NOT reach here — only explicit tool errors do.
+    /// </summary>
     public void MarkToolIncapable(string model)
     {
-        // T1/T2 implement
+        if (string.IsNullOrEmpty(model)) return;
+        _toolIncapable[model] = true;
     }
 
-    /// <summary>Whether a model is believed tool-capable (absent = optimistically capable). T1/T2 implement — always true in T0.</summary>
+    /// <summary>
+    /// Whether <paramref name="model"/> is believed tool-capable. Absent from the map = optimistically
+    /// capable (true); only an explicit demotion via <see cref="MarkToolIncapable"/> returns false.
+    /// </summary>
     public bool IsToolCapable(string model)
     {
-        // T1/T2 implement
-        return true;
+        if (string.IsNullOrEmpty(model)) return true;
+        return !_toolIncapable.ContainsKey(model);
     }
 }

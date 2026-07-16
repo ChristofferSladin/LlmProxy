@@ -4,7 +4,7 @@
 |----|-----------------------------------------|------|--------|------------|
 | T0 | test harness + seams (walking skeleton) | afk  | done   | -          |
 | T1 | cooldown registry                       | afk  | todo   | T0         |
-| T2 | learned tool-capability map + filter    | afk  | todo   | T1         |
+| T2 | learned tool-capability map + filter    | afk  | done   | T1         |
 | T3 | identity / continuity anchor            | afk  | done   | T0         |
 | T4 | declarative heuristic router            | afk  | todo   | T2         |
 
@@ -112,7 +112,7 @@ existing seams instead of racing the DI container / options class.
 
 ### T2 -- learned tool-capability map + filter
 - **type:** afk
-- **status:** todo
+- **status:** done
 - **blocked-by:** T1
 - **module:** `RoutingState` capability half — `MarkToolIncapable(model)` /
   `IsToolCapable(model)` (absent = optimistically capable); plus `RequestClassifier`
@@ -132,6 +132,37 @@ existing seams instead of racing the DI container / options class.
   tool-referencing error; hard-filter in candidate build), `LlmProxy.Tests/CapabilityTests.cs`
   (new).
 - **decisions:**
+  - **Classification seam:** new `static RequestClassifier.HasTools(JsonObject?)` — pure, returns true
+    iff the body has a non-empty `tools` array. Static (not injected) since it's a pure request-shape
+    probe; kept open for T4 to add `charCount`/`contentMatches` as sibling methods. `ProxyService`
+    computes `hasTools` **once** per request (right after body parse, before candidate build) and threads
+    it into `BuildCandidatesAsync` and both demote sites.
+  - **Capability map:** `MarkToolIncapable`/`IsToolCapable` over the existing `_toolIncapable`
+    `ConcurrentDictionary<string,bool>`. Presence = demoted → `IsToolCapable` false; absence =
+    optimistically capable → true. Empty model ids are ignored / treated capable. In-memory, thread-safe,
+    no options dependency (matches T1's parameterless DI + `new RoutingState()` in TestHost — zero DI churn).
+  - **Demote match (narrow):** private static `IsToolCapabilityError(string?)` — case-insensitive substring
+    match on `{ "tool", "function call", "function_call" }`. Applied at BOTH failure sites, but **only when
+    `hasTools`** is true: (1) the `peek.IsError` 200-err branch (matches `peek.Detail` OR `peek.Text`),
+    (2) the non-2xx branch (matches the `detail` string already read). Optimistic default means a missed
+    match costs at most one wasted attempt, never a false demotion. Silence (a 2xx good completion, no
+    tool_calls) never reaches a demote site, so it never demotes.
+  - **Hard filter:** private `DropToolIncapable(ordered, hasTools)` mirroring `DropCoolingDown` — no-op when
+    `!hasTools`; else drops known-incapable models preserving order; **never dead-ends** (empties → returns
+    the input list). Composed as `DropToolIncapable(DropCoolingDown(list), hasTools)` on BOTH candidate paths
+    (the `ForceModels`/static path and the dynamic path, before the `MaxDynamicCandidates` cap), so cooldown
+    + capability filters stack and neither can leave an empty pool.
+  - **Test demotion path (isolation choice):** the tool error is delivered as an HTTP **400** whose body
+    mentions tools. 400 is NOT a cooldown trigger (only 200-err/429 bench), so capability behavior is fully
+    isolated from cooldown. Per the current non-2xx control flow a 400 ("other 4xx") surfaces to the client
+    and the request ends without failover — so request 1 demotes-and-ends (status 400, `TriedModels == [A]`)
+    and a SUBSEQUENT tools request proves A is skipped (case a). Case (b) a non-tools request still hits A
+    (not benched, not filtered); case (c) a 200 good completion leaves A capable; case (d) marks both
+    incapable then asserts the tools request still attempts via the never-dead-end fallback.
+- **acceptance-result:** `dotnet build` green; `dotnet test LlmProxy.Tests/LlmProxy.Tests.csproj --filter
+  FullyQualifiedName~CapabilityTests` -> `Passed! - Failed: 0, Passed: 4`; full suite
+  `dotnet test LlmProxy.Tests/LlmProxy.Tests.csproj` -> `Passed! - Failed: 0, Passed: 13` (prior 9 + 4 new,
+  no regression).
 - **notes:** Silence ≠ incapable — only an explicit tool/function error demotes. The hard
   filter composes with T1's cooldown skip (both applied before the cap). PRD criterion:
   "Capability map".
