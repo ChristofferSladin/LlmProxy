@@ -67,13 +67,17 @@ public sealed class ProxyService
             return;
         }
 
-        // Proxy-owned global system prompt: replace any client system message with ours.
-        if (!string.IsNullOrWhiteSpace(route.Provider.SystemPrompt) && body["messages"] is JsonArray messages)
+        // Proxy-owned global system prompt: replace any client system message with the composed one
+        // (provider base + model-agnostic identity anchor). Composed even when the provider has no base
+        // prompt, so the anchor is injected on its own. When the composition is null/empty (no base and
+        // no anchor) nothing is injected and client messages are left untouched — today's behavior.
+        var systemContent = PromptComposer.Compose(route.Provider.SystemPrompt, _registry.Options.IdentityAnchor);
+        if (!string.IsNullOrEmpty(systemContent) && body["messages"] is JsonArray messages)
         {
             for (var i = messages.Count - 1; i >= 0; i--)
                 if (messages[i] is JsonObject m && m["role"]?.GetValue<string>() == "system")
                     messages.RemoveAt(i);
-            messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = route.Provider.SystemPrompt });
+            messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = systemContent });
         }
 
         var isStream = body["stream"]?.GetValue<bool>() ?? false;

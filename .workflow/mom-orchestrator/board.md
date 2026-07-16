@@ -5,7 +5,7 @@
 | T0 | test harness + seams (walking skeleton) | afk  | done   | -          |
 | T1 | cooldown registry                       | afk  | todo   | T0         |
 | T2 | learned tool-capability map + filter    | afk  | todo   | T1         |
-| T3 | identity / continuity anchor            | afk  | todo   | T0         |
+| T3 | identity / continuity anchor            | afk  | done   | T0         |
 | T4 | declarative heuristic router            | afk  | todo   | T2         |
 
 **DAG / ready-set flow**
@@ -134,6 +134,19 @@ existing seams instead of racing the DI container / options class.
 - **notes:** Model-agnostic — no `{model}` substitution (injection precedes the candidate
   loop; the announce line already names the winner). Off limits: editing `system-prompt.md`
   content. PRD criterion: "Identity anchor".
+- **status:** done
+- **decisions:** New pure `PromptComposer.Compose(base, anchor)`: both→`base + "\n\n" + anchor`,
+  anchor-only→anchor, base-only→base, both blank/whitespace→null. `ProxyService` injection block now
+  composes via `PromptComposer.Compose(route.Provider.SystemPrompt, _registry.Options.IdentityAnchor)`
+  and gates on the *composed* content being non-empty (was gated on `SystemPrompt` alone), so the
+  anchor is injected even when the provider has no base prompt. Kept the strip-then-insert guarded by
+  `!IsNullOrEmpty(systemContent)`: when nothing is composed (both blank) client system messages are
+  left untouched — byte-identical to today's "no provider prompt" path (not just "no injected system
+  message"). Did NOT touch `ProxyOptions.IdentityAnchor` default (T0 already ships a sensible default
+  string) nor `appsettings.json` (default lives in code; documenting it there was optional and skipped
+  to keep the diff minimal and disjoint from T1). Stayed out of `BuildCandidatesAsync`/candidate
+  loop/error branches/peek-relay. Tests inspect `Requests[0]` `messages[0]`; case (a) also asserts the
+  client-sent system message was stripped. `IdentityAnchorTests` 4/4 green; `FailoverTests` 2/2 still green.
 
 ### T4 -- declarative heuristic router
 - **type:** afk
