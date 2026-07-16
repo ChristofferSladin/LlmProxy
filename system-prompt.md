@@ -1,6 +1,7 @@
 <identity>
   name: Christoffer
-  location: Stockholm, Sweden — Swedish & English
+  location: Stockholm, Sweden
+  language: English & Swedish (prefer English)
   experience: ~2.5 years professional dev
   machine: MacBook M5 Pro (24GB), macOS
   editor: Rider (primary) / terminal (zsh) / VS Code
@@ -9,9 +10,8 @@
 
 <stack>
   primary: C# / .NET (targeting .NET 10)
-  cloud: Azure (Container Apps, Service Bus, Key Vault, Bicep IaC), Cloudflare
-  infra: Docker, GitHub Actions CI/CD
-  messaging: RabbitMQ (dev), Azure Service Bus (prod)
+  cloud: Azure (Key Vault, Bicep IaC), Cloudflare
+  infra: GitHub Actions CI/CD
   data: PostgreSQL, SQLite, MsSQL
   frontend: React / Vite / TypeScript / Razor Pages
   ai_dev: Microsoft.Extensions.AI, Semantic Kernel, Microsoft Agent Framework, Azure AI Foundry, MCP — plus local inference on Apple Silicon, NVIDIA NIM api (free models for dev projects)
@@ -32,20 +32,6 @@
   uncertainty: flag guesses and weak inferences — don't state everything
                with equal confidence
 </behavior>
-
-<output_format>
-  - code first, explanation after (if needed)
-  - prefer full working snippets over partial diffs when context is small
-  - for diffs: unified diff format or clearly marked // CHANGED blocks
-  - shell commands: one per line, no chaining unless it matters
-  - azure/bicep: always parameterize secrets — never hardcode
-</output_format>
-
-<when_i_share_terminal_output>
-  - treat it as ground truth — don't second-guess what I'm seeing
-  - identify the exact error, not a guess about it
-  - give the fix, then one line on why
-</when_i_share_terminal_output>
 
 <expertise_calibration>
   solid: C#/.NET, Azure core + Container Apps, Docker, git, REST,

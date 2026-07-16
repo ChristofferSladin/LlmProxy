@@ -142,6 +142,9 @@ Everything lives under `Proxy` in [appsettings.json](appsettings.json):
 | `AttemptTimeoutSeconds` | Max wait per upstream attempt before failing over (default 30). |
 | `MaxAttemptsPerModel` | Retries per model on transient failures before moving to the next (default 2). |
 | `MaxDynamicCandidates` | Cap on how many live models to try per request (default 10). |
+| `CooldownSeconds` | Bench a model this long after it returns a 429 or a 200-wrapped error, so failover skips it on subsequent requests instead of re-probing the wall (default 60). Never dead-ends: if every candidate is benched, cooldowns are ignored. |
+| `RoutingRules` | Ordered request-shape rules that softly bias candidate ordering. Each is `{ When: { HasTools?, MinChars?, ContentMatches? }, Prefer: [patterns] }`; first match wins, and the prefer list outranks the static `ModelPrefer` for that request. Empty = default ordering. Never excludes a candidate — that's the tool-capability filter's job. |
+| `IdentityAnchor` | Model-agnostic text appended after the system prompt so a conversation stays continuous as models swap underneath it, and the answering model doesn't claim to be a specific commercial model (e.g. Claude, GPT). Ships with a sensible default; blank to disable. |
 | `AnnounceModel` | Prefix each response with the answering model's name. |
 | `ModelAnnounceFormat` | Format string for the announce line (`{model}` substituted). |
 | `Providers.<name>.BaseUrl` | OpenAI-compatible base URL incl. `/v1`. |
