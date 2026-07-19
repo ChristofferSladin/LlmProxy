@@ -67,3 +67,7 @@ app.MapPost("/v1/embeddings", (HttpContext http, ProxyService proxy, Cancellatio
     proxy.ForwardJsonAsync(http, "embeddings", ct));
 
 app.Run();
+
+// Marker so `WebApplicationFactory<Program>` (LlmProxy.Tests/IntegrationHost.cs) can boot this
+// minimal-API app in-process for integration tests. Top-level statements above are unaffected.
+public partial class Program { }
