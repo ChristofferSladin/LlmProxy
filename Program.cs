@@ -38,21 +38,25 @@ ProxyOptions proxyOptions;
 // fills in the real cross-field consistency rules without touching Program.cs again.
 StartupValidation.Validate(proxyOptions, app.Environment);
 
-// --- Inbound auth (T0c: happy path only) ---
+// --- Inbound auth (T1: full rejection shapes over T0c's happy-path resolver) ---
 // Scoped to /v1/* by construction, not applied globally: the conditional path check below means
 // "/" and "/health" never reach InboundAuth.TryResolve and stay reachable with no header
-// regardless of InboundKeys configuration. T0c only needs to distinguish "let the request
-// through" (open — no keys configured — or a resolved caller) from everything else, which gets a
-// minimal generic 401 here; T1 owns the real rejection envelope (400 for out-of-grant alias,
-// rotation, no-key-material-in-logs, etc.) and replaces the body of the `if` below without
-// restructuring this middleware.
+// regardless of InboundKeys configuration (T0c's regression guarantee — unchanged here).
+// InboundAuthResult.Open and .Ok both mean "let the request through"; every other value is a
+// 401. All 401 reasons (no header, malformed header, unknown key) share one generic message —
+// never echo submitted key material, and never tell the client which specific reason applied
+// (that would let a bad guess probe for valid key shapes). Alias-grant enforcement (400s) needs
+// the parsed JSON body's "model" field, which this header-only middleware never sees — that check
+// lives in ProxyService.ForwardJsonAsync, right where the body is already parsed, using the
+// ResolvedCaller stashed below.
 app.Use(async (context, next) =>
 {
     if (context.Request.Path.StartsWithSegments("/v1"))
     {
         var options = context.RequestServices.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxyOptions>>().Value;
         var authHeader = context.Request.Headers["Authorization"].ToString();
-        if (!InboundAuth.TryResolve(string.IsNullOrEmpty(authHeader) ? null : authHeader, options, out var caller))
+        var result = InboundAuth.TryResolve(string.IsNullOrEmpty(authHeader) ? null : authHeader, options, out var caller);
+        if (result is InboundAuthResult.NoKeyProvided or InboundAuthResult.MalformedHeader or InboundAuthResult.UnknownKey)
         {
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
             context.Response.ContentType = "application/json";
@@ -62,8 +66,8 @@ app.Use(async (context, next) =>
         }
 
         // Only set when a key was actually resolved (keys configured + matched); the forwarding
-        // path (and T1's future alias-grant check) can look for this item's presence to know
-        // whether the caller is restricted at all.
+        // path's alias-grant check looks for this item's presence to know whether the caller is
+        // restricted at all.
         if (caller is not null) context.Items[InboundAuth.CallerItemKey] = caller;
     }
 

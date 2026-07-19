@@ -51,6 +51,30 @@ public sealed class ProxyService
 
         var clientModel = body["model"]?.GetValue<string>();
 
+        // T1: alias-grant enforcement. Needs the parsed body's "model" field, which the header-only
+        // /v1/* auth middleware in Program.cs never sees — so this check lives here, right after the
+        // body is parsed, rather than in InboundAuth's pipeline call site. The rule itself (grant
+        // membership, single-alias omission) stays in InboundAuth.CheckAliasGrant, unit-tested there;
+        // this is just the one place that already holds both the resolved caller and the parsed body.
+        if (http.Items.TryGetValue(InboundAuth.CallerItemKey, out var callerObj) && callerObj is ResolvedCaller caller)
+        {
+            var grant = InboundAuth.CheckAliasGrant(caller, clientModel, out var effectiveModel);
+            switch (grant)
+            {
+                case AliasGrantResult.AliasNotGranted:
+                    await WriteErrorAsync(http, StatusCodes.Status400BadRequest, "invalid_request_error",
+                        $"Model '{clientModel}' is not permitted for this key. Allowed aliases: {string.Join(", ", caller.Aliases)}.", ct);
+                    return;
+                case AliasGrantResult.ModelRequiredAmbiguous:
+                    await WriteErrorAsync(http, StatusCodes.Status400BadRequest, "invalid_request_error",
+                        $"This key grants multiple aliases ({string.Join(", ", caller.Aliases)}); the request must specify 'model'.", ct);
+                    return;
+            }
+
+            clientModel = effectiveModel;
+            body["model"] = effectiveModel;
+        }
+
         RouteTarget route;
         try { route = _registry.Resolve(clientModel); }
         catch (Exception ex)
