@@ -85,6 +85,14 @@ public sealed class ProxyService
         _registry.Options.ModelAliases.TryGetValue(clientModel ?? "", out var alias);
         var policy = AliasPolicy.Resolve(alias, route.Provider, _registry.Options);
 
+        // T4: alias-level ModelPrefer reorders candidates for THIS alias's requests only. policy.ModelPrefer
+        // falls back to the provider's own ModelPrefer when there's no alias override (see AliasPolicy),
+        // so gate on `alias is not null` — otherwise a non-aliased request would re-apply the provider's
+        // own ordering as a "soft override" and risk perturbing the byte-identical baseline ordering.
+        // Alias intent is more specific than a declarative routing rule, so it's promoted ahead of it.
+        var aliasPrefer = alias is not null ? policy.ModelPrefer : Array.Empty<string>();
+        var effectivePrefer = aliasPrefer.Count > 0 ? aliasPrefer.Concat(preferOverride).ToList() : preferOverride;
+
         // Proxy-owned system prompt, now applied via the prompt-mode seam. PromptMode.Own (today's
         // unset-alias default) reproduces the prior inline behavior exactly: composed provider base +
         // identity anchor replaces any client system message(s); nothing injected when both are blank.
@@ -100,7 +108,7 @@ public sealed class ProxyService
         IReadOnlyList<string> candidates;
         try
         {
-            candidates = await BuildCandidatesAsync(route, hasTools, preferOverride, policy.UpstreamModel, ct);
+            candidates = await BuildCandidatesAsync(route, hasTools, effectivePrefer, policy.UpstreamModel, ct);
         }
         catch (Exception ex)
         {
@@ -258,7 +266,7 @@ public sealed class ProxyService
             $"All candidate models failed for provider '{route.ProviderName}': {string.Join(", ", failures)}", ct);
     }
 
-    // Explicit config wins; otherwise pull chat-capable models live, last-good first, capped.
+    // Explicit config wins; otherwise pull chat-capable models live, pin-first then last-good, capped.
     // Benched (cooling-down) models are dropped from the ordered list before the cap so failover
     // doesn't re-probe a model that just hit its wall — but never dead-ends (see DropCoolingDown).
     // The soft prefer-override (T4) is a stable reorder applied to the already-FILTERED list (so it can
@@ -266,25 +274,29 @@ public sealed class ProxyService
     // override leaves ordering byte-identical to before.
     private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, IReadOnlyList<string> preferOverride, string? pin, CancellationToken ct)
     {
-        // T4 seam: pin-first-then-failover candidate seeding will read `pin` here. AliasPolicy always
-        // resolves it to null in T0a, so it is currently unused — plumbing only, no behavior change.
-        _ = pin;
-
+        // `pin` (an alias's UpstreamModel, T4) only matters for a DYNAMIC provider — on a static/ForceModels
+        // provider it's already baked into route.Models via ProviderRegistry.ResolveModels (untouched here).
         if (route.Provider.ForceModels.Count > 0 || !route.Provider.DynamicModels)
             return ApplyPreferOverride(DropToolIncapable(DropCoolingDown(route.Models), hasTools), preferOverride);
 
         var dynamic = DropToolIncapable(DropCoolingDown(await _catalog.GetChatCandidatesAsync(route.ProviderName, route.Provider, ct)), hasTools);
         var cap = Math.Max(1, _registry.Options.MaxDynamicCandidates);
 
-        // Base ordering over the FULL filtered list: last-good sticky first, then the rest in order.
+        // Base ordering over the FULL filtered list: pin first (T4) — but ONLY if it's already a live
+        // candidate today. A stale/renamed pin is silently skipped rather than forced in, so it can
+        // never waste an attempt on every request or dead-end a route (see ticket notes). Pin takes
+        // priority over last-good stickiness, per "pin-first"; last-good then fills the rest in order.
         var ranked = new List<string>(dynamic.Count);
-        if (_lastGood.TryGetValue(route.ProviderName, out var last) && dynamic.Contains(last))
+        if (!string.IsNullOrEmpty(pin) && dynamic.Contains(pin))
+            ranked.Add(pin);
+        if (_lastGood.TryGetValue(route.ProviderName, out var last) && dynamic.Contains(last) && !ranked.Contains(last))
             ranked.Add(last);
         foreach (var id in dynamic)
             if (!ranked.Contains(id)) ranked.Add(id);
 
-        // Soft prefer-override outranks both the provider's static ModelPrefer ordering AND last-good
-        // stickiness for this request: an explicit routing rule wins. Applied before the cap.
+        // Soft prefer-override outranks the provider's static ModelPrefer ordering, last-good stickiness,
+        // AND the pin's position for this request: an explicit routing rule / alias ModelPrefer wins.
+        // Applied before the cap.
         return ApplyPreferOverride(ranked, preferOverride).Take(cap).ToList();
     }
 

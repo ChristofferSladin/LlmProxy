@@ -20,6 +20,14 @@ public sealed class FakeUpstream : HttpMessageHandler
     private readonly List<Scripted> _queue = new();
     private readonly object _lock = new();
 
+    /// <summary>
+    /// Fakes a dynamic provider's live /v1/models catalog. When non-empty, any GET request (the
+    /// catalog fetch) is answered with this id list instead of going through the scripted POST queue —
+    /// and is NOT recorded in <see cref="Requests"/>/<see cref="TriedModels"/>, since it's not a chat
+    /// completion attempt.
+    /// </summary>
+    public List<string> CatalogModels { get; set; } = new();
+
     /// <summary>Every outgoing request, in order. The model id sent and the full request JSON body.</summary>
     public List<CapturedRequest> Requests { get; } = new();
 
@@ -42,6 +50,18 @@ public sealed class FakeUpstream : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
+        if (request.Method == HttpMethod.Get)
+        {
+            var data = new JsonArray();
+            foreach (var id in CatalogModels)
+                data.Add(new JsonObject { ["id"] = id, ["object"] = "model" });
+            var listBody = new JsonObject { ["object"] = "list", ["data"] = data }.ToJsonString();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(listBody, Encoding.UTF8, "application/json"),
+            };
+        }
+
         var bodyText = request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
         var model = TryReadModel(bodyText);
 

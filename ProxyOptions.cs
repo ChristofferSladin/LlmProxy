@@ -184,16 +184,17 @@ public sealed class ModelAlias
     /// <summary>
     /// Upstream model id substituted into the request body. If null, the client's model id is passed
     /// through. On a STATIC provider (see <see cref="ProviderOptions.DynamicModels"/>) this is wired
-    /// today via <see cref="ProviderRegistry"/> as the sole forced candidate (unchanged by T0a). On a
-    /// DYNAMIC provider this field is reused as the future pin-first-then-failover candidate (see
-    /// <see cref="EffectivePolicy.UpstreamModel"/>) — that seeding behavior is wired in T4, not here.
+    /// via <see cref="ProviderRegistry"/> as the sole forced candidate. On a DYNAMIC provider this is
+    /// resolved by <see cref="AliasPolicy.Resolve"/> into <see cref="EffectivePolicy.UpstreamModel"/>
+    /// and consumed by <see cref="ProxyService.BuildCandidatesAsync"/> as a pin-first-then-failover
+    /// seed (T4): tried first when it's already a live candidate, never forced in, never a filter.
     /// </summary>
     public string? UpstreamModel { get; set; }
 
     /// <summary>Per-alias prompt ownership override. Null ⇒ provider-level behavior (today's Own semantics). Consumed by T3.</summary>
     public PromptMode? PromptMode { get; set; }
 
-    /// <summary>Per-alias candidate ordering bias, overriding the provider's ModelPrefer for this alias's requests only. Null ⇒ provider's list. Consumed by T4.</summary>
+    /// <summary>Per-alias candidate ordering bias, overriding the provider's ModelPrefer for this alias's requests only. Null ⇒ provider's list. Consumed by T4 via <see cref="ProxyService.BuildCandidatesAsync"/>.</summary>
     public List<string>? ModelPrefer { get; set; }
 
     /// <summary>Per-alias attempt timeout override in seconds. Null ⇒ the global <see cref="ProxyOptions.AttemptTimeoutSeconds"/>. Consumed by T5.</summary>

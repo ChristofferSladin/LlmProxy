@@ -70,16 +70,36 @@ public sealed class AliasPolicyTests
     }
 
     /// <summary>
-    /// T0a decision: <see cref="ModelAlias.UpstreamModel"/> already has a distinct, wired meaning for
-    /// STATIC providers (forced single-candidate, via <see cref="ProviderRegistry"/> — unchanged by this
-    /// ticket). Repurposing the same field as the dynamic-provider pin is T4's job. Until T4 wires the
-    /// pin-first-then-failover candidate seeding, <see cref="EffectivePolicy.UpstreamModel"/> must stay
-    /// null even when an alias sets <see cref="ModelAlias.UpstreamModel"/> — this pins that decision down.
+    /// T4: lifts the T0a restriction. <see cref="ModelAlias.UpstreamModel"/> already has a distinct,
+    /// wired meaning for STATIC providers (forced single-candidate, via <see cref="ProviderRegistry"/> —
+    /// unchanged by this ticket); on a DYNAMIC provider it is now resolved here as the pin-first seed
+    /// that <see cref="ProxyService.BuildCandidatesAsync"/> reads. This replaces
+    /// <c>Alias_upstream_model_pin_stays_absent_in_T0a_regardless_of_alias_value</c>, which pinned down
+    /// T0a's deliberately-temporary "always null" restriction — T4 is explicitly tasked with lifting it,
+    /// so the old assertion (null regardless of alias value) is now the wrong behavior to guard.
     /// </summary>
     [Fact]
-    public void Alias_upstream_model_pin_stays_absent_in_T0a_regardless_of_alias_value()
+    public void Alias_upstream_model_pin_resolves_from_alias_value()
     {
         var alias = new ModelAlias { Provider = "nvidia", UpstreamModel = "moonshotai/kimi-k2.6" };
+
+        var policy = AliasPolicy.Resolve(alias, provider: null, Global());
+
+        Assert.Equal("moonshotai/kimi-k2.6", policy.UpstreamModel);
+    }
+
+    [Fact]
+    public void No_alias_resolves_upstream_model_to_null()
+    {
+        var policy = AliasPolicy.Resolve(alias: null, provider: null, Global());
+
+        Assert.Null(policy.UpstreamModel);
+    }
+
+    [Fact]
+    public void Alias_with_unset_upstream_model_resolves_to_null()
+    {
+        var alias = new ModelAlias { Provider = "nvidia" };
 
         var policy = AliasPolicy.Resolve(alias, provider: null, Global());
 
@@ -96,7 +116,7 @@ public sealed class AliasPolicyTests
             PromptMode = PromptMode.Anchor,
             ModelPrefer = new List<string> { "alias-pref" },
             AttemptTimeoutSeconds = 180,
-            UpstreamModel = "pinned-model", // still ignored — see dedicated test above
+            UpstreamModel = "pinned-model", // T4: now resolves — see dedicated pin test above
         };
 
         var policy = AliasPolicy.Resolve(alias, provider, Global(attemptTimeoutSeconds: 30));
@@ -104,6 +124,6 @@ public sealed class AliasPolicyTests
         Assert.Equal(PromptMode.Anchor, policy.PromptMode);
         Assert.Equal(new[] { "alias-pref" }, policy.ModelPrefer);
         Assert.Equal(180, policy.AttemptTimeoutSeconds);
-        Assert.Null(policy.UpstreamModel);
+        Assert.Equal("pinned-model", policy.UpstreamModel);
     }
 }
