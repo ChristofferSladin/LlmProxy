@@ -15,7 +15,7 @@ public sealed class FakeUpstream : HttpMessageHandler
     /// <summary>A captured outgoing upstream request.</summary>
     public sealed record CapturedRequest(string Method, string Url, string Model, string Body);
 
-    private sealed record Scripted(string? ModelMatch, int Status, string Body, bool Streaming);
+    private sealed record Scripted(string? ModelMatch, int Status, string Body, bool Streaming, int DelayMs);
 
     private readonly List<Scripted> _queue = new();
     private readonly object _lock = new();
@@ -41,10 +41,15 @@ public sealed class FakeUpstream : HttpMessageHandler
     /// Enqueue a scripted response. <paramref name="modelMatch"/> is a case-insensitive substring
     /// matched against the request body's <c>model</c> field; null is a catch-all. Responses are
     /// consumed in order among those whose match applies to the incoming request.
+    ///
+    /// <paramref name="delayMs"/> (T5): simulate a slow upstream by awaiting this many milliseconds,
+    /// honoring the caller's cancellation token, before returning the response — lets a test prove
+    /// attempt-timeout behavior (the delay outlasting the effective timeout throws
+    /// <see cref="TaskCanceledException"/> exactly like a real hung upstream would) without a real wait.
     /// </summary>
-    public FakeUpstream Enqueue(string? modelMatch, int status, string body, bool streaming = false)
+    public FakeUpstream Enqueue(string? modelMatch, int status, string body, bool streaming = false, int delayMs = 0)
     {
-        lock (_lock) _queue.Add(new Scripted(modelMatch, status, body, streaming));
+        lock (_lock) _queue.Add(new Scripted(modelMatch, status, body, streaming, delayMs));
         return this;
     }
 
@@ -92,6 +97,9 @@ public sealed class FakeUpstream : HttpMessageHandler
                     Encoding.UTF8, "application/json"),
             };
         }
+
+        if (match.DelayMs > 0)
+            await Task.Delay(match.DelayMs, cancellationToken); // throws if the caller's attempt timeout fires first
 
         var contentType = match.Streaming ? "text/event-stream" : "application/json";
         return new HttpResponseMessage((HttpStatusCode)match.Status)

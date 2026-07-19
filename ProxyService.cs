@@ -100,7 +100,11 @@ public sealed class ProxyService
 
         var isStream = body["stream"]?.GetValue<bool>() ?? false;
         var url = $"{route.Provider.BaseUrl.TrimEnd('/')}/{upstreamPath.TrimStart('/')}";
-        var attemptTimeout = TimeSpan.FromSeconds(Math.Max(5, policy.AttemptTimeoutSeconds));
+        // T5: floor lowered from 5s to 1s so a per-alias override (or a deliberately tight global
+        // value) can actually bind below the old floor — nothing in the PRD calls for a 5s minimum,
+        // and the old floor made a compressed-timeout behavioral test impossible. Still >0 so a
+        // misconfigured 0/negative value can't cancel an attempt before it's sent.
+        var attemptTimeout = TimeSpan.FromSeconds(Math.Max(1, policy.AttemptTimeoutSeconds));
         var maxAttempts = Math.Max(1, _registry.Options.MaxAttemptsPerModel);
         var cooldownWindow = TimeSpan.FromSeconds(Math.Max(0, _registry.Options.CooldownSeconds));
         var client = _httpFactory.CreateClient("upstream");
