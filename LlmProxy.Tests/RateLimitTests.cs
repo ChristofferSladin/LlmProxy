@@ -26,9 +26,12 @@ public sealed class RateLimitTests
         else
             client.DefaultRequestHeaders.Authorization = null;
 
+        // "fast" matches every key's granted alias in this file — T1's alias-grant enforcement
+        // (merged in after these tests were written against T0c) rejects an unrecognised model
+        // with 400 before the request ever reaches the rate limiter.
         return client.PostAsJsonAsync("/v1/chat/completions", new
         {
-            model = "auto",
+            model = "fast",
             messages = new[] { new { role = "user", content = "hello" } },
         });
     }
