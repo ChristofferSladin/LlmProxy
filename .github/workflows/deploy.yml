@@ -1,0 +1,81 @@
+name: Deploy
+
+# Builds, tests, and deploys the proxy to the T8 Azure App Service (Free tier) on every push to
+# main. No long-lived cloud credential is stored in the forge: azure/login authenticates via
+# OIDC federated credentials (see infra/setup-oidc.sh for the one-time human setup that creates
+# the federated credential this workflow relies on).
+#
+# Required repo configuration (Settings -> Secrets and variables -> Actions):
+#   Variables (vars.*), not secret — these are identifiers, not credentials:
+#     AZURE_CLIENT_ID       - the app registration (federated credential) client id
+#     AZURE_TENANT_ID       - the Azure AD tenant id
+#     AZURE_SUBSCRIPTION_ID - the target Azure subscription id
+#     AZURE_WEBAPP_NAME     - the deployed web app's name (matches infra `appName`-derived site
+#                             name, e.g. "llmproxy-app" if appName='llmproxy'; see infra/main.bicep
+#                             `siteName` var). This is an operator choice made at deploy time, not
+#                             hardcoded here.
+#   No secrets are required for this workflow. The NVIDIA_API_KEY and any inbound proxy keys are
+#   Azure App Service application settings (see infra/main.bicep), not GitHub secrets — this
+#   workflow does not touch them.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required for OIDC federated-credential login (azure/login)
+  contents: read
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          # Repo targets net10.0 (LlmProxy.csproj). Pinned to the 10.0.x channel so CI tracks
+          # servicing releases within .NET 10 without floating to a future major version.
+          # Assumption: by the time this workflow runs, a GA or RC .NET 10 SDK is resolvable from
+          # this channel spec on the actions/setup-dotnet-provided install source; if only a
+          # preview SDK is available when this is first run, this line may need
+          # `dotnet-version: '10.0.100-preview.x'` pinned to the exact preview build instead.
+          dotnet-version: '10.0.x'
+
+      - name: Test
+        # Safety gate: a failing test must block deploy. LlmProxy.Tests references LlmProxy.csproj
+        # (ProjectReference), so this also validates the app project builds.
+        run: dotnet test LlmProxy.Tests --configuration Release
+
+      - name: Publish (self-contained, linux-x64)
+        # Self-contained so the app carries its own .NET runtime — matches infra/main.bicep's
+        # `linuxFxVersion: ''` decision (T8): no managed runtime stack is provisioned on the App
+        # Service plan, the platform just executes the published apphost binary.
+        run: >
+          dotnet publish LlmProxy.csproj -c Release -r linux-x64 --self-contained true
+          -o ./publish
+
+      - name: Zip publish output
+        # Azure App Service zip-deploy expects a single zip archive; this also matches T8's
+        # WEBSITE_RUN_FROM_PACKAGE=1 app setting (run directly from the uploaded package).
+        run: |
+          cd publish
+          zip -r ../app.zip .
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          # No client-secret / creds JSON: federated credential trust is configured once via
+          # infra/setup-oidc.sh, so no long-lived secret is stored here.
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: app.zip

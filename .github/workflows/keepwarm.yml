@@ -1,0 +1,24 @@
+name: Keep warm
+
+# App Service F1 (Free) tier has no Always On, so the instance idles out after ~20 minutes and
+# the next request pays a several-second cold start (see infra/main.bicep comment on `alwaysOn:
+# false`). This workflow pings the unauthenticated /health endpoint every ~10 minutes to keep the
+# instance warm for all consumers. /health requires no credential (PRD: "The health and root
+# endpoints answer without a credential"), so no Azure login or key is needed here.
+#
+# Required repo configuration (Settings -> Secrets and variables -> Actions):
+#   Variables (vars.*):
+#     AZURE_WEBAPP_NAME - the deployed web app's name, used to build
+#                         https://<name>.azurewebsites.net/health (same variable as deploy.yml).
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Curl /health
+        run: curl -f "https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net/health"
