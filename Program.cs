@@ -19,8 +19,9 @@ builder.Services.AddSingleton<ProxyService>();
 var app = builder.Build();
 
 // Resolve SystemPromptFile -> SystemPrompt once at startup; fail fast if a configured file is missing.
+ProxyOptions proxyOptions;
 {
-    var proxyOptions = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxyOptions>>().Value;
+    proxyOptions = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxyOptions>>().Value;
     foreach (var (name, provider) in proxyOptions.Providers)
     {
         if (string.IsNullOrWhiteSpace(provider.SystemPromptFile)) continue;
@@ -32,6 +33,42 @@ var app = builder.Build();
         provider.SystemPrompt = File.ReadAllText(path).Trim();
     }
 }
+
+// T0c seam: startup-validation call site. No-op today (see StartupValidation's remarks) — T6
+// fills in the real cross-field consistency rules without touching Program.cs again.
+StartupValidation.Validate(proxyOptions, app.Environment);
+
+// --- Inbound auth (T0c: happy path only) ---
+// Scoped to /v1/* by construction, not applied globally: the conditional path check below means
+// "/" and "/health" never reach InboundAuth.TryResolve and stay reachable with no header
+// regardless of InboundKeys configuration. T0c only needs to distinguish "let the request
+// through" (open — no keys configured — or a resolved caller) from everything else, which gets a
+// minimal generic 401 here; T1 owns the real rejection envelope (400 for out-of-grant alias,
+// rotation, no-key-material-in-logs, etc.) and replaces the body of the `if` below without
+// restructuring this middleware.
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/v1"))
+    {
+        var options = context.RequestServices.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProxyOptions>>().Value;
+        var authHeader = context.Request.Headers["Authorization"].ToString();
+        if (!InboundAuth.TryResolve(string.IsNullOrEmpty(authHeader) ? null : authHeader, options, out var caller))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(
+                "{\"error\":{\"message\":\"Unauthorized\",\"type\":\"authentication_error\",\"code\":401}}");
+            return;
+        }
+
+        // Only set when a key was actually resolved (keys configured + matched); the forwarding
+        // path (and T1's future alias-grant check) can look for this item's presence to know
+        // whether the caller is restricted at all.
+        if (caller is not null) context.Items[InboundAuth.CallerItemKey] = caller;
+    }
+
+    await next(context);
+});
 
 // --- Health / root ---
 app.MapGet("/", () => Results.Ok(new { status = "ok", service = "llm-proxy" }));
