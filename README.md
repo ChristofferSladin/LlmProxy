@@ -191,3 +191,119 @@ the key never reaches LM Studio or any client — it's injected server-side per 
 
 - Port is set in `appsettings.json` under `Kestrel:Endpoints:Http:Url`.
 - Get a free NVIDIA NIM key at [build.nvidia.com](https://build.nvidia.com).
+
+## Service mode: first deploy
+
+Service mode runs the same binary as an authenticated, multi-consumer proxy on Azure App Service
+(Free/F1 tier). This section is the first-deploy runbook, in order. Full operational docs (key
+issuance/rotation reference, alias profile fields, the consumer migration map) land separately
+once every behavioural ticket is done — this section only covers getting a first instance live
+and verifying it.
+
+Files referenced below: `infra/main.bicep`, `infra/main.bicepparam`, `infra/setup-oidc.sh`,
+`.github/workflows/deploy.yml`, `.github/workflows/keepwarm.yml`, `scripts/smoke.sh`.
+
+### 1. One-time OIDC setup (human, `az login` required)
+
+Run `infra/setup-oidc.sh` once from a machine with the Azure CLI logged in as a user who can
+create app registrations and assign roles. Edit the script's `RESOURCE_GROUP` (and
+`GITHUB_REPO`/`GITHUB_BRANCH` if they differ) before running — see the script's header comment.
+It creates an Azure AD app registration with a federated credential trusting GitHub Actions'
+OIDC token for this repo's `main` branch (no long-lived client secret), and grants it
+`Website Contributor` scoped to the resource group only.
+
+It prints three values. Put them into the GitHub repo's **Settings → Secrets and variables →
+Actions → Variables** tab (variables, not secrets — none of these are credentials; the federated
+credential trust is what actually gates access):
+
+```
+AZURE_CLIENT_ID       = <printed appId>
+AZURE_TENANT_ID       = <printed tenant id>
+AZURE_SUBSCRIPTION_ID = <printed subscription id>
+```
+
+Also add a fourth variable, `AZURE_WEBAPP_NAME`, set to the site name the infra will produce —
+`<appName>-app`, e.g. `llmproxy-app` for the default `appName=llmproxy` in
+`infra/main.bicepparam`.
+
+### 2. Deploy the infrastructure
+
+From a machine with `az` logged in, create the resource group (matching `setup-oidc.sh`'s
+`RESOURCE_GROUP`) if it doesn't exist yet, then deploy the Bicep template. The NVIDIA key is
+passed at deploy time, not committed to `infra/main.bicepparam`:
+
+```bash
+az group create --name llmproxy-rg --location swedencentral
+
+az deployment group create \
+  --resource-group llmproxy-rg \
+  --template-file infra/main.bicep \
+  --parameters infra/main.bicepparam \
+  --parameters nvidiaApiKey=$NVIDIA_API_KEY
+```
+
+If this fails with a quota/SKU-not-available error for the F1 tier in `swedencentral`, retry
+with `--parameters location=westeurope` (the documented fallback — see `infra/main.bicep`'s
+header comment).
+
+The deployment output `defaultHostName` is the deployed base URL, e.g.
+`llmproxy-app.azurewebsites.net`.
+
+### 3. Set inbound keys (post-deploy, not in Bicep)
+
+Inbound keys are operator data that rotates independently of infra, so they're set as App
+Service settings after deploy, not baked into the template (see `infra/main.bicep`'s header
+comment). Each key needs three settings following the
+`Proxy__InboundKeys__<KeyId>__{App,Aliases__N,RequestsPerMinute}` convention. Worked example —
+issuing a key for `news-digest` with a 10 requests/minute budget:
+
+```bash
+az webapp config appsettings set \
+  --name llmproxy-app \
+  --resource-group llmproxy-rg \
+  --settings \
+    "Proxy__InboundKeys__<random-32-byte-key>__App=news-digest" \
+    "Proxy__InboundKeys__<random-32-byte-key>__Aliases__0=news-digest" \
+    "Proxy__InboundKeys__<random-32-byte-key>__RequestsPerMinute=10"
+```
+
+Generate `<random-32-byte-key>` with, e.g., `openssl rand -hex 32`, and use the same generated
+value as both the setting-name suffix and the key material the consumer app authenticates with
+(`Authorization: Bearer <random-32-byte-key>`). Repeat per app/alias; two live keys may share one
+`App` value for rotation without downtime.
+
+Without at least one inbound key set, `ASPNETCORE_ENVIRONMENT=Production` (set by
+`infra/main.bicep`) makes the host refuse to start — this is deliberate fail-fast behaviour, not
+a bug (see startup validation).
+
+### 4. Trigger the deploy workflow
+
+Push to `main`, or manually run `.github/workflows/deploy.yml` via **Actions → Deploy → Run
+workflow** (`workflow_dispatch`). The workflow builds, runs `dotnet test`, publishes
+self-contained `linux-x64`, authenticates via OIDC (no secret), and zip-deploys to the app
+created in step 2. It needs the four repo variables set in step 1 to be present, or the Azure
+login step fails.
+
+### 5. Smoke test the live instance
+
+Run `scripts/smoke.sh` against the deployed URL with a key issued in step 3:
+
+```bash
+scripts/smoke.sh https://llmproxy-app.azurewebsites.net <your-inbound-key> news-digest 10
+```
+
+(base URL, key, alias, and the key's configured `RequestsPerMinute` budget — the last two are
+optional; see `scripts/smoke.sh --help` / run with no args for full usage). This checks: `/health`
+reachable without a key, a keyed completion via the alias succeeds, a wrong key is rejected with
+401, a burst past the budget yields a 429 (skipped with a warning if no budget is supplied), and
+an indirect check that the Production config layer — and therefore the absence of the personal
+`system-prompt.md` from the deployed payload — is actually in effect.
+
+This is the one step of T11 that cannot run unattended: it needs a real deployed URL and a real
+key, so it's the human's step, not a night agent's.
+
+### Ongoing: keep-warm
+
+Once `AZURE_WEBAPP_NAME` is set and the app is deployed, `.github/workflows/keepwarm.yml` starts
+pinging `/health` every ~10 minutes on its own cron schedule automatically — no separate action
+needed after the first deploy.
