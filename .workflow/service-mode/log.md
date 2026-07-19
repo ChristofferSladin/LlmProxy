@@ -188,6 +188,68 @@ fourteen tickets.
 
 Run **/merge-night** to assemble the final `qa/service-mode` branch.
 
+---
+
+## Merge report — /merge-night
+
+**Base:** `main` (commit `124bb9f`, includes the board.md/log.md persistence commit).
+**Output:** branch `qa/service-mode`, worktree `.claude/worktrees/qa-service-mode`.
+
+### Merge sequence
+
+Rather than merge all fourteen ticket branches individually, two already-assembled superset
+branches from the nightshift run were merged instead — each already covers a cluster of tickets
+and was already proven green on its own:
+
+1. **`nightshift/t10`** (T0a, T0b, T0c, T1, T2, T3, T4, T5, T6 — assembled and proven 89/89 green
+   during nightshift's iteration 5) → **clean merge**, no conflicts.
+2. **`nightshift/t11`** (T6, T7, T8, T9, T11 — T6 shared with t10's lineage, so only T7/T8/T9/T11's
+   diffs applied) → **auto-merged with one trivial conflict**, in `README.md`: T10 and T11 each
+   added a distinct top-level section, but every cross-reference each made to the other's content
+   assumed it didn't exist yet (since neither ticket's worktree ever saw the other's work). Not a
+   textual conflict git flagged — both sections merged mechanically — but the *result* read wrong:
+   T10's "Deployment" pointer said "once those exist in this repository" (they now did), and T11's
+   runbook intro said "once every behavioural ticket is done" (it now was). **Resolved** by
+   relocating "Service mode: first deploy" to sit directly after the "Service mode" section it
+   belongs next to, and rewriting both stale forward-references — no content removed, only
+   cross-references and heading placement. Commit `cd020b8`.
+
+No branch was held back. Every ticket's work is present on `qa/service-mode`.
+
+### Integration check (beyond each ticket's own green)
+
+- `dotnet test LlmProxy.Tests` → **94/94 green** (up from T10's 89 — the +5 is T7's
+  `ProductionConfigTests`, which only entered the tree via the T11 merge).
+- `az bicep build --file infra/main.bicep` → clean compile.
+- Both GitHub Actions workflow YAML files parse.
+- `bash -n scripts/smoke.sh` → clean.
+- `dotnet publish -c Release -r linux-x64 --self-contained true` → succeeds (the actual command
+  `deploy.yml` runs).
+
+### Consolidated diff vs. `main`
+
+30 files changed, 3180 insertions(+), 28 deletions(-) — `git diff main...qa/service-mode --stat`.
+New: `AliasPolicy.cs`, `InboundAuth.cs`, `RateLimitPartition.cs`, `StartupValidation.cs`, 9 new
+test files, `appsettings.Production.json`, `infra/main.bicep` + `main.bicepparam` +
+`setup-oidc.sh`, `.github/workflows/deploy.yml` + `keepwarm.yml`, `scripts/smoke.sh`. Modified:
+`ProxyOptions.cs`, `ProxyService.cs`, `PromptComposer.cs`, `Program.cs`, `TestHost.cs`,
+`FakeUpstream.cs`, `README.md`.
+
+### DAG-smell note for /kanban next time
+
+The three collisions flagged during nightshift (`ProxyService.cs` T1×T4/T5, `ProxyOptions.cs`
+T2×T4, `Program.cs` T1×T2) all resolved as git auto-merges with zero conflict markers — the T0c
+split correctly kept them file-disjoint enough for three-way merge to work. The one real
+human-judgment fix needed at merge time was **T2's test fixtures predating T1's alias-grant
+enforcement** (a runtime behavior interaction between two tickets' tests, not a textual merge
+conflict — nothing in /kanban's file-collision analysis would have caught this ahead of time,
+since it's a semantic dependency between T1 and T2's *behavior*, not their files). Worth noting
+for future boards: when two tickets both gate the same request pipeline (auth + rate limiting),
+consider a fixture-sharing convention or sequencing one behind the other's test data, even when
+their *code* files are disjoint.
+
+Run **/qa-plan** to review `qa/service-mode`.
+
 ### Known merge-night risk (flagging now, not fixing tonight)
 
 Three spine files were independently touched by tickets that branched from a common ancestor
