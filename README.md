@@ -357,36 +357,15 @@ swaps below happen later, in their own repos.
 
 ### Deployment
 
-Deploying service mode (infrastructure-as-code, CI/CD, and the first-deploy runbook) is covered
-separately — see the deploy workflow and infrastructure definitions under `infra/` and
-`.github/workflows/` and the runbook they ship with, once those exist in this repository.
-
-## Secrets
-
-Real API keys go in **`appsettings.Local.json`** (git-ignored, layered on top of
-`appsettings.json` at startup) — never in the committed config:
-
-```json
-{
-  "Proxy": { "Providers": { "nvidia": { "ApiKey": "nvapi-..." } } }
-}
-```
-
-`ApiKeyEnv` (an environment variable) is checked first and takes precedence if set. Either way,
-the key never reaches LM Studio or any client — it's injected server-side per request.
-
-## Notes
-
-- Port is set in `appsettings.json` under `Kestrel:Endpoints:Http:Url`.
-- Get a free NVIDIA NIM key at [build.nvidia.com](https://build.nvidia.com).
+Service mode runs the same binary as an authenticated, multi-consumer proxy on Azure App Service
+(Free/F1 tier), via the infrastructure-as-code and CI/CD under `infra/` and `.github/workflows/`.
+See "Service mode: first deploy" below for the runbook.
 
 ## Service mode: first deploy
 
-Service mode runs the same binary as an authenticated, multi-consumer proxy on Azure App Service
-(Free/F1 tier). This section is the first-deploy runbook, in order. Full operational docs (key
-issuance/rotation reference, alias profile fields, the consumer migration map) land separately
-once every behavioural ticket is done — this section only covers getting a first instance live
-and verifying it.
+This is the first-deploy runbook, in order — getting a first instance live and verifying it.
+Full operational reference (key issuance/rotation, alias profile fields, the consumer migration
+map) is in "Service mode" above.
 
 Files referenced below: `infra/main.bicep`, `infra/main.bicepparam`, `infra/setup-oidc.sh`,
 `.github/workflows/deploy.yml`, `.github/workflows/keepwarm.yml`, `scripts/smoke.sh`.
@@ -495,3 +474,22 @@ key, so it's the human's step, not a night agent's.
 Once `AZURE_WEBAPP_NAME` is set and the app is deployed, `.github/workflows/keepwarm.yml` starts
 pinging `/health` every ~10 minutes on its own cron schedule automatically — no separate action
 needed after the first deploy.
+
+## Secrets
+
+Real API keys go in **`appsettings.Local.json`** (git-ignored, layered on top of
+`appsettings.json` at startup) — never in the committed config:
+
+```json
+{
+  "Proxy": { "Providers": { "nvidia": { "ApiKey": "nvapi-..." } } }
+}
+```
+
+`ApiKeyEnv` (an environment variable) is checked first and takes precedence if set. Either way,
+the key never reaches LM Studio or any client — it's injected server-side per request.
+
+## Notes
+
+- Port is set in `appsettings.json` under `Kestrel:Endpoints:Http:Url`.
+- Get a free NVIDIA NIM key at [build.nvidia.com](https://build.nvidia.com).
