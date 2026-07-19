@@ -60,6 +60,14 @@ public sealed class ProxyOptions
     /// (rate limiting) and T6 (startup validation).
     /// </summary>
     public Dictionary<string, InboundKey> InboundKeys { get; set; } = new();
+
+    /// <summary>
+    /// Length, in seconds, of one rate-limit window (see <see cref="RateLimitCounter"/>). Defaults
+    /// to 60 to match <see cref="InboundKey.RequestsPerMinute"/>'s "per minute" semantics.
+    /// Overridable so integration tests can compress the window and burst without a real 60-second
+    /// sleep; production should leave this at the default. Consumed by T2.
+    /// </summary>
+    public int RateLimitWindowSeconds { get; set; } = 60;
 }
 
 /// <summary>
