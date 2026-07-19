@@ -70,6 +70,34 @@ app.Use(async (context, next) =>
     await next(context);
 });
 
+// --- Rate limiting (T2) ---
+// Registered as a second middleware, strictly AFTER the auth middleware above: it reads
+// context.Items[InboundAuth.CallerItemKey], which is only populated once auth has resolved the
+// caller (rate limiting partitions by App, which doesn't exist until then — see the PRD's Risks
+// section on pipeline ordering). No caller in Items => either "/v1" wasn't matched or no keys are
+// configured (open path) => skip rate limiting entirely, preserving today's unconfigured-means-
+// unlimited local behavior. See RateLimitCounter's remarks for why this is a hand-rolled counter
+// rather than Microsoft.AspNetCore.RateLimiting's AddRateLimiter.
+var rateLimiter = new RateLimitCounter(TimeSpan.FromSeconds(proxyOptions.RateLimitWindowSeconds));
+app.Use(async (context, next) =>
+{
+    if (context.Items.TryGetValue(InboundAuth.CallerItemKey, out var callerObj) && callerObj is ResolvedCaller caller)
+    {
+        var result = rateLimiter.TryAcquire(RateLimitPartition.KeyFor(caller), caller.RequestsPerMinute);
+        if (!result.Allowed)
+        {
+            context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            context.Response.Headers["Retry-After"] = result.RetryAfterSeconds.ToString();
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(
+                "{\"error\":{\"message\":\"Rate limit exceeded\",\"type\":\"rate_limit_error\",\"code\":429}}");
+            return;
+        }
+    }
+
+    await next(context);
+});
+
 // --- Health / root ---
 app.MapGet("/", () => Results.Ok(new { status = "ok", service = "llm-proxy" }));
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
