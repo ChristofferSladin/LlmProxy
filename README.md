@@ -155,7 +155,9 @@ Everything lives under `Proxy` in [appsettings.json](appsettings.json):
 | `Providers.<name>.ModelExclude` | Override the built-in non-chat filter keywords. |
 | `Providers.<name>.ForceModel` / `ForceModels` | Pin to one model, or an explicit fallback chain (skips dynamic selection). |
 | `Providers.<name>.SystemPromptFile` / `SystemPrompt` | Global system prompt — file path (preferred) or inline string. |
-| `ModelAliases.<id>` | Map a client-facing id → `{ Provider, UpstreamModel }`. |
+| `ModelAliases.<id>` | Map a client-facing id → a routing profile (`Provider`, `UpstreamModel`, plus the service-mode fields below). See [Service mode](#service-mode) for the full alias reference. |
+| `InboundKeys.<key>` | Per-application bearer key record. Absent/empty ⇒ authentication disabled (today's local behavior). See [Service mode](#service-mode). |
+| `RateLimitWindowSeconds` | Length of one rate-limit window in seconds (default 60, matching `RequestsPerMinute`'s "per minute" semantics). See [Service mode](#service-mode). |
 
 ### Add another provider
 
@@ -172,6 +174,192 @@ The other four are already listed with `HideFromModels: true`. To make Groq the 
   "fast": { "Provider": "groq", "UpstreamModel": "llama-3.3-70b-versatile" }
 }
 ```
+
+## Service mode
+
+The same binary runs in two modes, selected entirely by configuration:
+
+- **Local mode** — no `Proxy:InboundKeys` configured. This is the LM Studio setup described
+  above: no inbound auth, no rate limiting, the provider owns the system prompt. **This is
+  byte-identical to the proxy's original behavior — it is the backward-compatibility guarantee
+  the whole feature was built around.** Nothing in this section changes how the local instance
+  behaves; every rule below only activates once at least one key exists in `InboundKeys`.
+- **Service mode** — one or more `InboundKeys` entries configured. The proxy becomes an
+  authenticated, multi-consumer front end: each caller (a separate application, not a person)
+  authenticates with a bearer key, is restricted to the aliases its key grants, and gets its own
+  rate-limit budget. The existing failover engine (cooldown, tool-capability filtering, routing
+  rules, never-dead-end) runs underneath both modes, completely unchanged.
+
+The two modes are not separate deployments — the same `appsettings.json`/`appsettings.Local.json`
+layering that already exists is where you add `InboundKeys` and per-alias fields to turn service
+mode on.
+
+### Inbound keys
+
+`Proxy:InboundKeys` is a dictionary keyed by the secret key string itself. Each entry (an
+`InboundKey`) is `{ App, Aliases, RequestsPerMinute }`:
+
+```jsonc
+"Proxy": {
+  "InboundKeys": {
+    // 32 bytes of CSPRNG entropy per key. Two live keys may share an App (see Rotation below).
+    "<random-key-1>": { "App": "ai-news-digest",   "Aliases": ["news-digest"], "RequestsPerMinute": 10 },
+    "<random-key-2>": { "App": "portfolio",        "Aliases": ["portfolio"],   "RequestsPerMinute": 20 },
+    "<random-key-3>": { "App": "blockchain-agent", "Aliases": ["bca"],         "RequestsPerMinute": 5 }
+  },
+  "ModelAliases": {
+    "news-digest": { "Provider": "nvidia", "PromptMode": "Passthrough",
+                     "ModelPrefer": ["llama-3.1-8b", "flash"] },
+    "portfolio":   { "Provider": "nvidia", "PromptMode": "Anchor",
+                     "ModelPrefer": ["deepseek-ai/deepseek-v4-flash", "llama-3.3-70b", "nemotron-super"] },
+    "bca":         { "Provider": "nvidia", "PromptMode": "Passthrough",
+                     "UpstreamModel": "moonshotai/kimi-k2.6",
+                     "ModelPrefer": ["kimi", "deepseek", "nemotron"],
+                     "AttemptTimeoutSeconds": 180 }
+  }
+}
+```
+
+| `InboundKey` field | Meaning |
+|---|---|
+| `App` | Attribution name used in logs and as the rate-limit partition key. Never the key material itself. |
+| `Aliases` | The only `ModelAliases` names this key may request. |
+| `RequestsPerMinute` | Per-minute budget for this key's `App`. Null/omitted = unlimited. |
+
+**Issuance.** There is no registration flow, no token endpoint, and no proxy-issued credential —
+adding a key is a config edit: add an entry to `InboundKeys` (generate the key string yourself,
+32 bytes of CSPRNG entropy, e.g. `openssl rand -base64 32`), give it an `App` name, grant it the
+aliases it needs, redeploy. This is a deliberate decision, not an oversight: the consumers are
+machine-to-machine calls with no end user, so a JWT/login-endpoint flow would add a hop and a
+signing key without removing the underlying secret each app still has to hold at startup — see
+the brief's decisions log for the full reasoning (and the trigger — end-user identity reaching the
+proxy — that would revisit it in favor of Entra ID client-credentials).
+
+**Rotation.** Two live keys may map to the same `App` at the same time — this is what makes
+rotation a deploy instead of an outage: add the new key (same `App`, same `Aliases`) alongside the
+old one, update the consuming app's configuration to the new key, redeploy the app, then remove
+the old key entry from `InboundKeys` and redeploy the proxy. The rate-limit budget is shared by
+`App`, not doubled by having two live keys (see [Rate limiting](#rate-limiting) below).
+
+**Revocation.** Delete the key entry from `InboundKeys` and redeploy. The blast radius of a leaked
+key is exactly one `App` and only the aliases it was granted — a leak doesn't expose any other
+application's identity, prompt policy, or budget. If the app has a second live key (mid-rotation),
+it keeps running on that one.
+
+**What a key grants.** A key may only request the aliases listed in its `Aliases`:
+
+- If the key grants exactly **one** alias, the request's `model` field may be omitted — it's
+  routed to that alias automatically.
+- If the key grants **more than one** alias, the request must specify `model` explicitly; omitting
+  it is rejected with `400` (`"This key grants multiple aliases (...); the request must specify
+  'model'."`).
+- Requesting a `model` that isn't one of the key's granted aliases is rejected with `400`, naming
+  the aliases that key may use (`"Model '<x>' is not permitted for this key. Allowed aliases:
+  ..."`).
+- A missing, malformed (not `Bearer <token>`), or unrecognized key is rejected with `401` and a
+  generic body (`{"error":{"message":"Unauthorized","type":"authentication_error","code":401}}`).
+  All three reasons return the identical body deliberately — the client is never told *which*
+  reason applied, so a bad guess can't be used to probe for valid key shapes. Key material is
+  never written to logs or echoed in any response, on any path, including rejection.
+
+`/` and `/health` never require a key, in either mode — this is what the keep-warm ping depends
+on.
+
+### Alias routing profiles
+
+`ModelAliases.<id>` maps a client-facing model id to a full routing profile, not just a provider +
+model pair. Beyond the existing `Provider` and `UpstreamModel`, four fields exist purely to
+support service mode; all are optional and each one's absence reproduces today's local behavior
+exactly:
+
+| Field | Meaning | Absent ⇒ |
+|---|---|---|
+| `PromptMode` | `Passthrough`, `Anchor`, or `Own` — see below. | `Own` (today's provider-owned prompt behavior) |
+| `UpstreamModel` | On a **static** provider (`DynamicModels: false`), the forced single candidate — unchanged, existing behavior. On a **dynamic** provider (`DynamicModels: true`), this is now a **pin-first-then-failover** seed: tried first, but *only if it's currently a live candidate* from the provider's catalog; if it fails or isn't live, normal dynamic failover proceeds behind it. It is never forced in and never a filter, so a stale/renamed pin can't dead-end a request. | Dynamic discovery only (today's behavior) — on a dynamic provider with no pin, candidates come purely from the live catalog. |
+| `ModelPrefer` | Per-alias candidate ordering bias, overriding the provider's own `ModelPrefer` for this alias's requests only. Non-aliased requests keep the provider's ordering untouched. | The provider's `ModelPrefer` |
+| `AttemptTimeoutSeconds` | Per-alias override of the global `AttemptTimeoutSeconds` for this alias's requests. | The global `AttemptTimeoutSeconds` (default 30) |
+
+**`PromptMode` — the three values, precisely:**
+
+- **`Passthrough`** — the client's `messages` array is relayed byte-identical: nothing removed,
+  nothing inserted, order and content preserved exactly as sent. Use this when the caller owns its
+  own system prompt (e.g. `news-digest`'s summarizer prompt, `bca`'s structured-output
+  instructions) and the proxy must not interfere with it.
+- **`Anchor`** — every client message is preserved (including any system message(s) the client
+  sent — nothing is stripped), and exactly one additional system message carrying the proxy's
+  `IdentityAnchor` text is inserted after the client's *last* system message (or as the first
+  message if the client sent none). Use this when the caller has its own assistant persona but
+  should still inherit the proxy's "don't claim to be a specific commercial model, maintain
+  continuity across a failover" instruction (e.g. `portfolio`). A blank/unset `IdentityAnchor`
+  injects nothing.
+- **`Own` (the default when unset)** — today's original behavior: any system message(s) the client
+  sent are stripped and replaced with one composed system message (the provider's base
+  `SystemPrompt`/`SystemPromptFile` plus `IdentityAnchor`, joined by a blank line). This is what
+  local/LM Studio mode uses and what an alias with no `PromptMode` set continues to use.
+
+All non-`messages` body fields (`response_format`, `temperature`, sampling parameters, etc.) pass
+through unmodified in every mode — only `messages` (per `PromptMode`) and `model` (rewritten to
+the alias's upstream target) are ever touched.
+
+### Rate limiting
+
+`InboundKey.RequestsPerMinute` sets a per-minute budget, partitioned by the key's **`App`, not the
+key string** — so two live keys rotated for the same application share one budget rather than
+doubling it. `Proxy:RateLimitWindowSeconds` (default 60) sets the window length globally.
+
+- **Unconfigured = unlimited.** A key with no `RequestsPerMinute` is never throttled. If no
+  `InboundKeys` are configured at all, rate limiting doesn't run — local mode is unaffected.
+- One application exhausting its budget never affects another application's.
+- A rate-limit rejection is decided **before any upstream call** — it never counts against a
+  model's cooldown/bench state in `RoutingState`.
+- Rejections return `429` with a `Retry-After` header (seconds until the window resets, minimum
+  1) and a generic JSON error body (`{"error":{"message":"Rate limit exceeded","type":
+  "rate_limit_error","code":429}}`).
+
+Per-application budgets should sum comfortably under the shared upstream provider's own rate
+limit (NVIDIA NIM's free tier is roughly 40 requests/minute across every consumer, local
+instance included) — staggering batch jobs against that shared ceiling is each consuming
+application's responsibility, not the proxy's.
+
+### Startup validation
+
+The host validates configuration at startup and refuses to start — collecting every violation
+into one error rather than failing on the first — when:
+
+- The environment is `Production` and zero `InboundKeys` are configured (a misconfigured deploy
+  must not come up wide open on a public URL).
+- An `InboundKeys` entry grants an alias name that doesn't exist in `ModelAliases` (a config typo
+  must surface at deploy time, not as a runtime `400` later).
+- A `ModelAliases` entry names a provider that isn't configured under `Providers`.
+
+Every validation error names the offending key's **`App`**, never the key string itself — so a
+startup failure log is safe to paste anywhere.
+
+### Consumer migration map
+
+The following describes how each consumer application **would** integrate with the proxy in
+service mode — it is reference material carried forward from the design brief, not a task list for
+this repository. No code in any of these repositories is touched by this work; the config-only
+swaps below happen later, in their own repos.
+
+- **ai-news-digest** (daily batch job): swap its Gemini-shaped endpoint config to point at the
+  proxy (`.../v1/`), set its model field to `news-digest`, and swap its API key setting to the
+  app's inbound proxy key. Its existing 429-aware retry (honoring `Retry-After`) and
+  fallback-to-description behavior already tolerate the proxy's failure modes without changes.
+- **ChristofferSladinPortoflio**: the chat widget's backend calls the proxy with alias
+  `portfolio`; the key stays server-side and is never shipped to the browser. A `429` from the
+  proxy should surface as a friendly "busy, try again" message rather than a raw error.
+- **BlockchainAgent**: point its NVIDIA endpoint constant at the proxy, set its model env var to
+  `bca` (the model field carries the alias name), and swap its API key to the inbound proxy key.
+  Because `bca`'s `AttemptTimeoutSeconds` (180s) can multiply by the retry count per model, the
+  consuming application's own HTTP client timeout needs to tolerate the worst case, not just the
+  per-attempt timeout alone.
+
+### Deployment
+
+Deploying service mode (infrastructure-as-code, CI/CD, and the first-deploy runbook) is covered
+separately — see the deploy workflow and infrastructure definitions under `infra/` and
+`.github/workflows/` and the runbook they ship with, once those exist in this repository.
 
 ## Secrets
 
