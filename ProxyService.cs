@@ -51,6 +51,30 @@ public sealed class ProxyService
 
         var clientModel = body["model"]?.GetValue<string>();
 
+        // T1: alias-grant enforcement. Needs the parsed body's "model" field, which the header-only
+        // /v1/* auth middleware in Program.cs never sees — so this check lives here, right after the
+        // body is parsed, rather than in InboundAuth's pipeline call site. The rule itself (grant
+        // membership, single-alias omission) stays in InboundAuth.CheckAliasGrant, unit-tested there;
+        // this is just the one place that already holds both the resolved caller and the parsed body.
+        if (http.Items.TryGetValue(InboundAuth.CallerItemKey, out var callerObj) && callerObj is ResolvedCaller caller)
+        {
+            var grant = InboundAuth.CheckAliasGrant(caller, clientModel, out var effectiveModel);
+            switch (grant)
+            {
+                case AliasGrantResult.AliasNotGranted:
+                    await WriteErrorAsync(http, StatusCodes.Status400BadRequest, "invalid_request_error",
+                        $"Model '{clientModel}' is not permitted for this key. Allowed aliases: {string.Join(", ", caller.Aliases)}.", ct);
+                    return;
+                case AliasGrantResult.ModelRequiredAmbiguous:
+                    await WriteErrorAsync(http, StatusCodes.Status400BadRequest, "invalid_request_error",
+                        $"This key grants multiple aliases ({string.Join(", ", caller.Aliases)}); the request must specify 'model'.", ct);
+                    return;
+            }
+
+            clientModel = effectiveModel;
+            body["model"] = effectiveModel;
+        }
+
         RouteTarget route;
         try { route = _registry.Resolve(clientModel); }
         catch (Exception ex)
@@ -79,22 +103,32 @@ public sealed class ProxyService
         // Empty RoutingRules (or no match) → empty list → today's ordering exactly (backward-compat).
         var preferOverride = new RoutingRuleSet(_registry.Options.RoutingRules).PreferOverride(classification);
 
-        // Proxy-owned global system prompt: replace any client system message with the composed one
-        // (provider base + model-agnostic identity anchor). Composed even when the provider has no base
-        // prompt, so the anchor is injected on its own. When the composition is null/empty (no base and
-        // no anchor) nothing is injected and client messages are left untouched — today's behavior.
-        var systemContent = PromptComposer.Compose(route.Provider.SystemPrompt, _registry.Options.IdentityAnchor);
-        if (!string.IsNullOrEmpty(systemContent) && body["messages"] is JsonArray messages)
-        {
-            for (var i = messages.Count - 1; i >= 0; i--)
-                if (messages[i] is JsonObject m && m["role"]?.GetValue<string>() == "system")
-                    messages.RemoveAt(i);
-            messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = systemContent });
-        }
+        // Effective-policy seam (T0a): resolve the alias → provider → global precedence chain once per
+        // request. Every field resolves to today's default when the alias is unset (or there is none),
+        // so this is a pure refactor — see AliasPolicy's remarks for what each field will unlock later.
+        _registry.Options.ModelAliases.TryGetValue(clientModel ?? "", out var alias);
+        var policy = AliasPolicy.Resolve(alias, route.Provider, _registry.Options);
+
+        // T4: alias-level ModelPrefer reorders candidates for THIS alias's requests only. policy.ModelPrefer
+        // falls back to the provider's own ModelPrefer when there's no alias override (see AliasPolicy),
+        // so gate on `alias is not null` — otherwise a non-aliased request would re-apply the provider's
+        // own ordering as a "soft override" and risk perturbing the byte-identical baseline ordering.
+        // Alias intent is more specific than a declarative routing rule, so it's promoted ahead of it.
+        var aliasPrefer = alias is not null ? policy.ModelPrefer : Array.Empty<string>();
+        var effectivePrefer = aliasPrefer.Count > 0 ? aliasPrefer.Concat(preferOverride).ToList() : preferOverride;
+
+        // Proxy-owned system prompt, now applied via the prompt-mode seam. PromptMode.Own (today's
+        // unset-alias default) reproduces the prior inline behavior exactly: composed provider base +
+        // identity anchor replaces any client system message(s); nothing injected when both are blank.
+        PromptComposer.Apply(policy, route.Provider.SystemPrompt, _registry.Options.IdentityAnchor, body);
 
         var isStream = body["stream"]?.GetValue<bool>() ?? false;
         var url = $"{route.Provider.BaseUrl.TrimEnd('/')}/{upstreamPath.TrimStart('/')}";
-        var attemptTimeout = TimeSpan.FromSeconds(Math.Max(5, _registry.Options.AttemptTimeoutSeconds));
+        // T5: floor lowered from 5s to 1s so a per-alias override (or a deliberately tight global
+        // value) can actually bind below the old floor — nothing in the PRD calls for a 5s minimum,
+        // and the old floor made a compressed-timeout behavioral test impossible. Still >0 so a
+        // misconfigured 0/negative value can't cancel an attempt before it's sent.
+        var attemptTimeout = TimeSpan.FromSeconds(Math.Max(1, policy.AttemptTimeoutSeconds));
         var maxAttempts = Math.Max(1, _registry.Options.MaxAttemptsPerModel);
         var cooldownWindow = TimeSpan.FromSeconds(Math.Max(0, _registry.Options.CooldownSeconds));
         var client = _httpFactory.CreateClient("upstream");
@@ -102,7 +136,7 @@ public sealed class ProxyService
         IReadOnlyList<string> candidates;
         try
         {
-            candidates = await BuildCandidatesAsync(route, hasTools, preferOverride, ct);
+            candidates = await BuildCandidatesAsync(route, hasTools, effectivePrefer, policy.UpstreamModel, ct);
         }
         catch (Exception ex)
         {
@@ -260,29 +294,37 @@ public sealed class ProxyService
             $"All candidate models failed for provider '{route.ProviderName}': {string.Join(", ", failures)}", ct);
     }
 
-    // Explicit config wins; otherwise pull chat-capable models live, last-good first, capped.
+    // Explicit config wins; otherwise pull chat-capable models live, pin-first then last-good, capped.
     // Benched (cooling-down) models are dropped from the ordered list before the cap so failover
     // doesn't re-probe a model that just hit its wall — but never dead-ends (see DropCoolingDown).
     // The soft prefer-override (T4) is a stable reorder applied to the already-FILTERED list (so it can
     // never re-introduce a filtered model) and BEFORE the cap (so a promoted model isn't cut). An empty
     // override leaves ordering byte-identical to before.
-    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, IReadOnlyList<string> preferOverride, CancellationToken ct)
+    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, IReadOnlyList<string> preferOverride, string? pin, CancellationToken ct)
     {
+        // `pin` (an alias's UpstreamModel, T4) only matters for a DYNAMIC provider — on a static/ForceModels
+        // provider it's already baked into route.Models via ProviderRegistry.ResolveModels (untouched here).
         if (route.Provider.ForceModels.Count > 0 || !route.Provider.DynamicModels)
             return ApplyPreferOverride(DropToolIncapable(DropCoolingDown(route.Models), hasTools), preferOverride);
 
         var dynamic = DropToolIncapable(DropCoolingDown(await _catalog.GetChatCandidatesAsync(route.ProviderName, route.Provider, ct)), hasTools);
         var cap = Math.Max(1, _registry.Options.MaxDynamicCandidates);
 
-        // Base ordering over the FULL filtered list: last-good sticky first, then the rest in order.
+        // Base ordering over the FULL filtered list: pin first (T4) — but ONLY if it's already a live
+        // candidate today. A stale/renamed pin is silently skipped rather than forced in, so it can
+        // never waste an attempt on every request or dead-end a route (see ticket notes). Pin takes
+        // priority over last-good stickiness, per "pin-first"; last-good then fills the rest in order.
         var ranked = new List<string>(dynamic.Count);
-        if (_lastGood.TryGetValue(route.ProviderName, out var last) && dynamic.Contains(last))
+        if (!string.IsNullOrEmpty(pin) && dynamic.Contains(pin))
+            ranked.Add(pin);
+        if (_lastGood.TryGetValue(route.ProviderName, out var last) && dynamic.Contains(last) && !ranked.Contains(last))
             ranked.Add(last);
         foreach (var id in dynamic)
             if (!ranked.Contains(id)) ranked.Add(id);
 
-        // Soft prefer-override outranks both the provider's static ModelPrefer ordering AND last-good
-        // stickiness for this request: an explicit routing rule wins. Applied before the cap.
+        // Soft prefer-override outranks the provider's static ModelPrefer ordering, last-good stickiness,
+        // AND the pin's position for this request: an explicit routing rule / alias ModelPrefer wins.
+        // Applied before the cap.
         return ApplyPreferOverride(ranked, preferOverride).Take(cap).ToList();
     }
 

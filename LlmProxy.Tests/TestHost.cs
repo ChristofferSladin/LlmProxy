@@ -31,8 +31,14 @@ public sealed class TestHost
     /// Build a host with a single "nvidia" provider whose candidate chain is <paramref name="forceModels"/>.
     /// A literal ApiKey keeps ResolveApiKey() non-empty; <paramref name="configure"/> can tweak the
     /// provider (e.g. add a SystemPrompt) before construction.
+    ///
+    /// Pass <paramref name="dynamicCatalog"/> instead of <paramref name="forceModels"/> to build a
+    /// DYNAMIC provider (<see cref="ProviderOptions.DynamicModels"/> = true) whose live /v1/models
+    /// catalog is faked via <see cref="FakeUpstream.CatalogModels"/> — used for alias pin-first /
+    /// per-alias-prefer tests (T4) where the static ForceModels chain would bypass the candidate-seeding
+    /// code path entirely.
     /// </summary>
-    public static TestHost Create(IEnumerable<string>? forceModels = null, Action<ProviderOptions>? configure = null, Action<ProxyOptions>? configureOptions = null)
+    public static TestHost Create(IEnumerable<string>? forceModels = null, Action<ProviderOptions>? configure = null, Action<ProxyOptions>? configureOptions = null, IEnumerable<string>? dynamicCatalog = null)
     {
         var upstream = new FakeUpstream();
 
@@ -40,8 +46,17 @@ public sealed class TestHost
         {
             BaseUrl = "https://fake.upstream/v1",
             ApiKey = "test-key",
-            ForceModels = (forceModels ?? new[] { "deepseek", "llama" }).ToList(),
         };
+
+        if (dynamicCatalog is not null)
+        {
+            provider.DynamicModels = true;
+            upstream.CatalogModels = dynamicCatalog.ToList();
+        }
+        else
+        {
+            provider.ForceModels = (forceModels ?? new[] { "deepseek", "llama" }).ToList();
+        }
         configure?.Invoke(provider);
 
         var options = new ProxyOptions

@@ -53,6 +53,54 @@ public sealed class ProxyOptions
 
     /// <summary>Ordered declarative routing rules that bias candidate prefer-ordering by request shape. Empty = today's ordering. Consumed by T4.</summary>
     public List<RoutingRule> RoutingRules { get; set; } = new();
+
+    /// <summary>
+    /// Per-application inbound bearer keys, keyed by the (secret) key string itself. Absent/empty ⇒
+    /// authentication disabled — today's open local behavior. Inert in T0a; consumed by T1 (auth), T2
+    /// (rate limiting) and T6 (startup validation).
+    /// </summary>
+    public Dictionary<string, InboundKey> InboundKeys { get; set; } = new();
+
+    /// <summary>
+    /// Length, in seconds, of one rate-limit window (see <see cref="RateLimitCounter"/>). Defaults
+    /// to 60 to match <see cref="InboundKey.RequestsPerMinute"/>'s "per minute" semantics.
+    /// Overridable so integration tests can compress the window and burst without a real 60-second
+    /// sleep; production should leave this at the default. Consumed by T2.
+    /// </summary>
+    public int RateLimitWindowSeconds { get; set; } = 60;
+}
+
+/// <summary>
+/// A single inbound bearer key record: which application it belongs to, which aliases it may request,
+/// and its optional per-minute request budget. Two live keys may map to the same <see cref="App"/> to
+/// make rotation a deploy rather than an outage. Inert in T0a — no code path reads this dictionary yet.
+/// </summary>
+public sealed class InboundKey
+{
+    /// <summary>Attribution name for logs and the rate-limit partition (never the key material itself).</summary>
+    public string App { get; set; } = "";
+
+    /// <summary>The only alias names this key may request. A single-alias key may omit "model" on the request.</summary>
+    public List<string> Aliases { get; set; } = new();
+
+    /// <summary>Per-minute request budget for this key's application. Null = unlimited.</summary>
+    public int? RequestsPerMinute { get; set; }
+}
+
+/// <summary>
+/// Per-alias prompt ownership. Unset (null on <see cref="ModelAlias.PromptMode"/>) resolves to
+/// <see cref="Own"/> via <see cref="AliasPolicy.Resolve"/> — today's provider-level behavior.
+/// </summary>
+public enum PromptMode
+{
+    /// <summary>Relay the client's messages unmodified: no message removed, none inserted. Consumed by T3.</summary>
+    Passthrough,
+
+    /// <summary>Preserve every client message and add exactly one system message carrying the identity anchor. Consumed by T3.</summary>
+    Anchor,
+
+    /// <summary>Today's behavior: client system message(s) stripped and replaced by the composed provider prompt + anchor.</summary>
+    Own,
 }
 
 /// <summary>A single declarative routing rule: when the request matches <see cref="When"/>, bias toward <see cref="Prefer"/>.</summary>
@@ -141,6 +189,22 @@ public sealed class ModelAlias
     /// <summary>Provider key to route to.</summary>
     public string Provider { get; set; } = "";
 
-    /// <summary>Upstream model id substituted into the request body. If null, the client's model id is passed through.</summary>
+    /// <summary>
+    /// Upstream model id substituted into the request body. If null, the client's model id is passed
+    /// through. On a STATIC provider (see <see cref="ProviderOptions.DynamicModels"/>) this is wired
+    /// via <see cref="ProviderRegistry"/> as the sole forced candidate. On a DYNAMIC provider this is
+    /// resolved by <see cref="AliasPolicy.Resolve"/> into <see cref="EffectivePolicy.UpstreamModel"/>
+    /// and consumed by <see cref="ProxyService.BuildCandidatesAsync"/> as a pin-first-then-failover
+    /// seed (T4): tried first when it's already a live candidate, never forced in, never a filter.
+    /// </summary>
     public string? UpstreamModel { get; set; }
+
+    /// <summary>Per-alias prompt ownership override. Null ⇒ provider-level behavior (today's Own semantics). Consumed by T3.</summary>
+    public PromptMode? PromptMode { get; set; }
+
+    /// <summary>Per-alias candidate ordering bias, overriding the provider's ModelPrefer for this alias's requests only. Null ⇒ provider's list. Consumed by T4 via <see cref="ProxyService.BuildCandidatesAsync"/>.</summary>
+    public List<string>? ModelPrefer { get; set; }
+
+    /// <summary>Per-alias attempt timeout override in seconds. Null ⇒ the global <see cref="ProxyOptions.AttemptTimeoutSeconds"/>. Consumed by T5.</summary>
+    public int? AttemptTimeoutSeconds { get; set; }
 }
