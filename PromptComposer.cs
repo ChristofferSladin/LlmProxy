@@ -39,7 +39,10 @@ public static class PromptComposer
     /// composition is empty (see <see cref="Compose"/>).</item>
     /// <item><see cref="PromptMode.Passthrough"/> — no mutation: the client's messages are relayed
     /// byte-identical.</item>
-    /// <item><see cref="PromptMode.Anchor"/> — not implemented here; wired in ticket T3.</item>
+    /// <item><see cref="PromptMode.Anchor"/> — every client message is preserved (including any
+    /// system message(s) they sent) and exactly one system message carrying the identity anchor
+    /// is inserted after the client's last system message (first if none). Nothing is inserted
+    /// when the anchor is blank/null.</item>
     /// </list>
     /// </summary>
     public static void Apply(EffectivePolicy policy, string? providerSystemPrompt, string? identityAnchor, JsonObject body)
@@ -50,9 +53,8 @@ public static class PromptComposer
                 return;
 
             case PromptMode.Anchor:
-                throw new NotSupportedException(
-                    "PromptMode.Anchor is not implemented yet — it lands in ticket T3. " +
-                    "No alias should resolve to this mode before then.");
+                ApplyAnchor(identityAnchor, body);
+                return;
 
             case PromptMode.Own:
             default:
@@ -70,5 +72,26 @@ public static class PromptComposer
             if (messages[i] is JsonObject m && m["role"]?.GetValue<string>() == "system")
                 messages.RemoveAt(i);
         messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = systemContent });
+    }
+
+    /// <summary>
+    /// Preserve every client message (including any system message(s) they sent — unlike
+    /// <see cref="ApplyOwn"/>, nothing is stripped) and insert exactly one additional system
+    /// message carrying <paramref name="identityAnchor"/>. Inserted after the client's LAST
+    /// system message if they sent any, or as the first message if they sent none. Blank/null
+    /// anchor injects nothing, matching <see cref="Compose"/>'s "nothing to inject" convention.
+    /// </summary>
+    private static void ApplyAnchor(string? identityAnchor, JsonObject body)
+    {
+        if (string.IsNullOrWhiteSpace(identityAnchor) || body["messages"] is not JsonArray messages) return;
+
+        var anchorMessage = new JsonObject { ["role"] = "system", ["content"] = identityAnchor };
+
+        var lastSystemIndex = -1;
+        for (var i = 0; i < messages.Count; i++)
+            if (messages[i] is JsonObject m && m["role"]?.GetValue<string>() == "system")
+                lastSystemIndex = i;
+
+        messages.Insert(lastSystemIndex + 1, anchorMessage);
     }
 }
