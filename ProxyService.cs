@@ -79,22 +79,20 @@ public sealed class ProxyService
         // Empty RoutingRules (or no match) → empty list → today's ordering exactly (backward-compat).
         var preferOverride = new RoutingRuleSet(_registry.Options.RoutingRules).PreferOverride(classification);
 
-        // Proxy-owned global system prompt: replace any client system message with the composed one
-        // (provider base + model-agnostic identity anchor). Composed even when the provider has no base
-        // prompt, so the anchor is injected on its own. When the composition is null/empty (no base and
-        // no anchor) nothing is injected and client messages are left untouched — today's behavior.
-        var systemContent = PromptComposer.Compose(route.Provider.SystemPrompt, _registry.Options.IdentityAnchor);
-        if (!string.IsNullOrEmpty(systemContent) && body["messages"] is JsonArray messages)
-        {
-            for (var i = messages.Count - 1; i >= 0; i--)
-                if (messages[i] is JsonObject m && m["role"]?.GetValue<string>() == "system")
-                    messages.RemoveAt(i);
-            messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = systemContent });
-        }
+        // Effective-policy seam (T0a): resolve the alias → provider → global precedence chain once per
+        // request. Every field resolves to today's default when the alias is unset (or there is none),
+        // so this is a pure refactor — see AliasPolicy's remarks for what each field will unlock later.
+        _registry.Options.ModelAliases.TryGetValue(clientModel ?? "", out var alias);
+        var policy = AliasPolicy.Resolve(alias, route.Provider, _registry.Options);
+
+        // Proxy-owned system prompt, now applied via the prompt-mode seam. PromptMode.Own (today's
+        // unset-alias default) reproduces the prior inline behavior exactly: composed provider base +
+        // identity anchor replaces any client system message(s); nothing injected when both are blank.
+        PromptComposer.Apply(policy, route.Provider.SystemPrompt, _registry.Options.IdentityAnchor, body);
 
         var isStream = body["stream"]?.GetValue<bool>() ?? false;
         var url = $"{route.Provider.BaseUrl.TrimEnd('/')}/{upstreamPath.TrimStart('/')}";
-        var attemptTimeout = TimeSpan.FromSeconds(Math.Max(5, _registry.Options.AttemptTimeoutSeconds));
+        var attemptTimeout = TimeSpan.FromSeconds(Math.Max(5, policy.AttemptTimeoutSeconds));
         var maxAttempts = Math.Max(1, _registry.Options.MaxAttemptsPerModel);
         var cooldownWindow = TimeSpan.FromSeconds(Math.Max(0, _registry.Options.CooldownSeconds));
         var client = _httpFactory.CreateClient("upstream");
@@ -102,7 +100,7 @@ public sealed class ProxyService
         IReadOnlyList<string> candidates;
         try
         {
-            candidates = await BuildCandidatesAsync(route, hasTools, preferOverride, ct);
+            candidates = await BuildCandidatesAsync(route, hasTools, preferOverride, policy.UpstreamModel, ct);
         }
         catch (Exception ex)
         {
@@ -266,8 +264,12 @@ public sealed class ProxyService
     // The soft prefer-override (T4) is a stable reorder applied to the already-FILTERED list (so it can
     // never re-introduce a filtered model) and BEFORE the cap (so a promoted model isn't cut). An empty
     // override leaves ordering byte-identical to before.
-    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, IReadOnlyList<string> preferOverride, CancellationToken ct)
+    private async Task<IReadOnlyList<string>> BuildCandidatesAsync(RouteTarget route, bool hasTools, IReadOnlyList<string> preferOverride, string? pin, CancellationToken ct)
     {
+        // T4 seam: pin-first-then-failover candidate seeding will read `pin` here. AliasPolicy always
+        // resolves it to null in T0a, so it is currently unused — plumbing only, no behavior change.
+        _ = pin;
+
         if (route.Provider.ForceModels.Count > 0 || !route.Provider.DynamicModels)
             return ApplyPreferOverride(DropToolIncapable(DropCoolingDown(route.Models), hasTools), preferOverride);
 

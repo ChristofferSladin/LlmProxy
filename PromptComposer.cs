@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+
 namespace LlmProxy;
 
 /// <summary>
@@ -25,5 +27,48 @@ public static class PromptComposer
         if (hasAnchor) return identityAnchor;
         if (hasBase) return providerSystemPrompt;
         return null;
+    }
+
+    /// <summary>
+    /// Apply an alias's effective prompt mode to the client's message list, mutating
+    /// <paramref name="body"/>'s "messages" array in place.
+    /// <list type="bullet">
+    /// <item><see cref="PromptMode.Own"/> (today's unset-alias default) — client system message(s) are
+    /// stripped and replaced with the composed provider-base + identity-anchor system message, exactly
+    /// as the forwarding path did inline before this seam existed. Nothing is injected when the
+    /// composition is empty (see <see cref="Compose"/>).</item>
+    /// <item><see cref="PromptMode.Passthrough"/> — no mutation: the client's messages are relayed
+    /// byte-identical.</item>
+    /// <item><see cref="PromptMode.Anchor"/> — not implemented here; wired in ticket T3.</item>
+    /// </list>
+    /// </summary>
+    public static void Apply(EffectivePolicy policy, string? providerSystemPrompt, string? identityAnchor, JsonObject body)
+    {
+        switch (policy.PromptMode)
+        {
+            case PromptMode.Passthrough:
+                return;
+
+            case PromptMode.Anchor:
+                throw new NotSupportedException(
+                    "PromptMode.Anchor is not implemented yet — it lands in ticket T3. " +
+                    "No alias should resolve to this mode before then.");
+
+            case PromptMode.Own:
+            default:
+                ApplyOwn(providerSystemPrompt, identityAnchor, body);
+                return;
+        }
+    }
+
+    private static void ApplyOwn(string? providerSystemPrompt, string? identityAnchor, JsonObject body)
+    {
+        var systemContent = Compose(providerSystemPrompt, identityAnchor);
+        if (string.IsNullOrEmpty(systemContent) || body["messages"] is not JsonArray messages) return;
+
+        for (var i = messages.Count - 1; i >= 0; i--)
+            if (messages[i] is JsonObject m && m["role"]?.GetValue<string>() == "system")
+                messages.RemoveAt(i);
+        messages.Insert(0, new JsonObject { ["role"] = "system", ["content"] = systemContent });
     }
 }
