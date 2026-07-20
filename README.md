@@ -364,6 +364,12 @@ Service mode runs the same binary as an authenticated, multi-consumer proxy on A
 (Free/F1 tier), via the infrastructure-as-code and CI/CD under `infra/` and `.github/workflows/`.
 See "Service mode: first deploy" below for the runbook.
 
+**Live since 2026-07-20**: `https://llmproxy-app.azurewebsites.net` (resource group
+`llmproxy-rg`, swedencentral), deployed by `deploy.yml` on every push to `main`, kept warm by
+`keepwarm.yml`. All three consumers from the migration map are wired: ai-news-digest
+(`news-digest`), the portfolio chat backend (`portfolio`), and BlockchainAgent (`bca`). Inbound
+keys are App Service settings — see step 3 of the runbook and the redeploy warning there.
+
 ## Service mode: first deploy
 
 This is the first-deploy runbook, in order — getting a first instance live and verifying it.
