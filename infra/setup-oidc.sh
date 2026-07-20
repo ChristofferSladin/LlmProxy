@@ -25,6 +25,10 @@
 # Safe to re-run: each `az ad app federated-credential create` / role assignment call is
 # idempotent-ish (Azure will error on an exact duplicate name, which is a safe no-op signal,
 # not data loss).
+#
+# PREREQUISITE: the resource group ($RESOURCE_GROUP) must already exist — the role assignment
+# in step 3 is scoped to it and fails with ResourceGroupNotFound otherwise. Create it first:
+#   az group create --name llmproxy-rg --location swedencentral
 
 set -euo pipefail
 

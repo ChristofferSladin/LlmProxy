@@ -228,7 +228,10 @@ mode on.
 
 **Issuance.** There is no registration flow, no token endpoint, and no proxy-issued credential —
 adding a key is a config edit: add an entry to `InboundKeys` (generate the key string yourself,
-32 bytes of CSPRNG entropy, e.g. `openssl rand -base64 32`), give it an `App` name, grant it the
+24 bytes of CSPRNG entropy, e.g. `openssl rand -hex 24` — hex, not base64, and not longer: the
+key string becomes part of an App Service *setting name* on Azure, which forbids base64's
+`+`/`/`/`=` characters and rejects names longer than ~100 characters), give it an `App` name,
+grant it the
 aliases it needs, redeploy. This is a deliberate decision, not an oversight: the consumers are
 machine-to-machine calls with no end user, so a JWT/login-endpoint flow would add a hop and a
 signing key without removing the underlying secret each app still has to hold at startup — see
@@ -372,7 +375,14 @@ Files referenced below: `infra/main.bicep`, `infra/main.bicepparam`, `infra/setu
 
 ### 1. One-time OIDC setup (human, `az login` required)
 
-Run `infra/setup-oidc.sh` once from a machine with the Azure CLI logged in as a user who can
+First create the resource group — the script's role assignment is scoped to it and fails if it
+doesn't exist yet:
+
+```bash
+az group create --name llmproxy-rg --location swedencentral
+```
+
+Then run `infra/setup-oidc.sh` once from a machine with the Azure CLI logged in as a user who can
 create app registrations and assign roles. Edit the script's `RESOURCE_GROUP` (and
 `GITHUB_REPO`/`GITHUB_BRANCH` if they differ) before running — see the script's header comment.
 It creates an Azure AD app registration with a federated credential trusting GitHub Actions'
@@ -395,18 +405,17 @@ Also add a fourth variable, `AZURE_WEBAPP_NAME`, set to the site name the infra 
 
 ### 2. Deploy the infrastructure
 
-From a machine with `az` logged in, create the resource group (matching `setup-oidc.sh`'s
-`RESOURCE_GROUP`) if it doesn't exist yet, then deploy the Bicep template. The NVIDIA key is
-passed at deploy time, not committed to `infra/main.bicepparam`:
+From a machine with `az` logged in, deploy the Bicep template into the resource group created in
+step 1. The NVIDIA key is read from the `NVIDIA_API_KEY` environment variable at deploy time by
+`infra/main.bicepparam` (`readEnvironmentVariable`), never committed — a separate
+`--parameters nvidiaApiKey=...` override alongside a `.bicepparam` file does not work (Bicep
+requires the params file to assign every declared parameter, error BCP258):
 
 ```bash
-az group create --name llmproxy-rg --location swedencentral
-
-az deployment group create \
+NVIDIA_API_KEY=nvapi-... az deployment group create \
   --resource-group llmproxy-rg \
   --template-file infra/main.bicep \
-  --parameters infra/main.bicepparam \
-  --parameters nvidiaApiKey=$NVIDIA_API_KEY
+  --parameters infra/main.bicepparam
 ```
 
 If this fails with a quota/SKU-not-available error for the F1 tier in `swedencentral`, retry
@@ -429,14 +438,16 @@ az webapp config appsettings set \
   --name llmproxy-app \
   --resource-group llmproxy-rg \
   --settings \
-    "Proxy__InboundKeys__<random-32-byte-key>__App=news-digest" \
-    "Proxy__InboundKeys__<random-32-byte-key>__Aliases__0=news-digest" \
-    "Proxy__InboundKeys__<random-32-byte-key>__RequestsPerMinute=10"
+    "Proxy__InboundKeys__<random-24-byte-key>__App=news-digest" \
+    "Proxy__InboundKeys__<random-24-byte-key>__Aliases__0=news-digest" \
+    "Proxy__InboundKeys__<random-24-byte-key>__RequestsPerMinute=10"
 ```
 
-Generate `<random-32-byte-key>` with, e.g., `openssl rand -hex 32`, and use the same generated
+Generate `<random-24-byte-key>` with `openssl rand -hex 24` (48 hex chars — longer keys push the
+`__RequestsPerMinute` setting name past App Service's ~100-character name limit and the whole
+`appsettings set` call fails with a bare `Bad Request`), and use the same generated
 value as both the setting-name suffix and the key material the consumer app authenticates with
-(`Authorization: Bearer <random-32-byte-key>`). Repeat per app/alias; two live keys may share one
+(`Authorization: Bearer <random-24-byte-key>`). Repeat per app/alias; two live keys may share one
 `App` value for rotation without downtime.
 
 Without at least one inbound key set, `ASPNETCORE_ENVIRONMENT=Production` (set by
