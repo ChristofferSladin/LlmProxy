@@ -29,6 +29,13 @@
 // This keeps key material and rotation entirely out of source control and out of `bicep`/`az
 // deployment` history. Revisit flattening only if key management via CLI/portal becomes a
 // friction point worth trading for infra-as-code churn.
+//
+// THE COST OF THAT DECISION (hit on the first live deploy): ARM treats this template's
+// siteConfig.appSettings as the COMPLETE settings collection — every `az deployment group
+// create` rerun of this template REPLACES all app settings, silently deleting any inbound keys
+// configured post-deploy, and the app then refuses to start in Production (startup validation:
+// zero InboundKeys). After ANY redeploy of this template, re-apply the inbound-key settings
+// (keep the JSON you set them with) and restart the app.
 
 @description('Base name used to derive resource names (plan, app). Must be globally unique for the web app hostname.')
 param appName string = 'llmproxy'
@@ -64,10 +71,14 @@ resource site 'Microsoft.Web/sites@2023-12-01' = {
     serverFarmId: plan.id
     httpsOnly: true
     siteConfig: {
-      // Self-contained linux-x64 publish carries its own .NET runtime, so no
-      // `DOTNETCORE|X.Y` linuxFxVersion stack is needed; leaving it empty lets the platform
-      // just execute the deployed apphost binary instead of provisioning a managed runtime.
-      linuxFxVersion: ''
+      // A stack MUST be declared even for a self-contained publish: with an empty
+      // linuxFxVersion, App Service Linux provisions no app container at all and the platform
+      // nginx front end serves 404/403 defaults (observed on the first live deploy). The
+      // DOTNETCORE container is only the host shell here — appCommandLine executes the
+      // self-contained apphost directly, so the container's own runtime version is irrelevant
+      // to the app.
+      linuxFxVersion: 'DOTNETCORE|10.0'
+      appCommandLine: '/home/site/wwwroot/LlmProxy'
       // F1 (Free) tier does not support Always On and rejects `alwaysOn: true` outright.
       // Cold starts after ~20 min idle are mitigated by the T9 keep-warm workflow.
       alwaysOn: false

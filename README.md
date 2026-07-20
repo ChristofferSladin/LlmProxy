@@ -454,6 +454,12 @@ Without at least one inbound key set, `ASPNETCORE_ENVIRONMENT=Production` (set b
 `infra/main.bicep`) makes the host refuse to start — this is deliberate fail-fast behaviour, not
 a bug (see startup validation).
 
+**Redeploy warning:** every rerun of `az deployment group create` with `infra/main.bicep`
+replaces the app's *entire* settings collection with the template's three entries, silently
+deleting the inbound keys set in this step — and the app then fail-fasts as above. Keep the
+settings JSON you issued keys with, and after any infra redeploy re-apply it
+(`az webapp config appsettings set ... --settings @<file>`) and restart the app.
+
 ### 4. Trigger the deploy workflow
 
 Push to `main`, or manually run `.github/workflows/deploy.yml` via **Actions → Deploy → Run
